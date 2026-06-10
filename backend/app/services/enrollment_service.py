@@ -3,6 +3,8 @@
 # delegation, mirroring the Phase 3 assessment_service.py split.
 from datetime import datetime, timezone
 
+from bson import ObjectId
+from bson.errors import InvalidId
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
@@ -11,24 +13,40 @@ from app.models.enrollment import EnrollmentProgress
 # Agent Rule #3: Motor (async) driver only — every DB call below is awaited.
 
 
-def _attach_track_data(enrollment: dict, plan_exists: bool) -> dict:
-    """Enrich a stored enrollment doc with its static track entry + plan_exists.
+async def _attach_track_data(enrollment: dict, plan_exists: bool, db: AsyncIOMotorDatabase) -> dict:
+    """Enrich a stored enrollment doc with its track catalog entry + plan_exists.
 
     Deferred import: app.api.v1.tracks imports this module to call its
-    functions, and this module needs that module's TRACKS_BY_ID — a top-level
-    `from app.api.v1.tracks import TRACKS_BY_ID` would be a circular import.
+    functions, and this module needs that module's runtime catalog helper — a
+    top-level import would be a circular import.
     Resolving it lazily, inside the function body, breaks the cycle because by
     the time `enroll`/`get_enrollment`/etc. are actually *called*, both modules
     have finished loading.
     """
-    from app.api.v1.tracks import TRACKS_BY_ID
+    from app.api.v1.tracks import get_track_or_none
 
-    return {**enrollment, "track": TRACKS_BY_ID[enrollment["track_id"]], "plan_exists": plan_exists}
+    return {
+        **enrollment,
+        "track": await get_track_or_none(enrollment["track_id"], db),
+        "plan_exists": plan_exists,
+    }
 
 
 async def _plan_exists(user_id: str, track_id: str, db: AsyncIOMotorDatabase) -> bool:
     plan = await db["plans"].find_one({"user_id": user_id, "track_id": track_id}, {"_id": 1})
     return plan is not None
+
+
+async def _profile_skill_level(user_id: str, db: AsyncIOMotorDatabase) -> str:
+    try:
+        object_id = ObjectId(user_id)
+    except (InvalidId, TypeError):
+        return "beginner"
+
+    user = await db["users"].find_one({"_id": object_id}, {"normalized_level": 1, "profile": 1})
+    profile = user.get("profile") if user else None
+    skill_level = (user or {}).get("normalized_level") or (profile or {}).get("normalized_level")
+    return skill_level if skill_level in {"beginner", "intermediate", "advanced"} else "beginner"
 
 
 async def enroll(user_id: str, track_id: str, db: AsyncIOMotorDatabase) -> dict:
@@ -38,16 +56,16 @@ async def enroll(user_id: str, track_id: str, db: AsyncIOMotorDatabase) -> dict:
     if existing is not None:
         existing["id"] = str(existing.pop("_id"))
         plan_exists = await _plan_exists(user_id, track_id, db)
-        return _attach_track_data(existing, plan_exists)
+        return await _attach_track_data(existing, plan_exists, db)
 
-    # Seed the starting skill level from the most recent assessment result.
-    # Falls back to "beginner" only as a safety net — the client always routes
-    # through the assessment before enrollment is reachable in the UI.
+    # Seed from the most recent assessment when available; otherwise use the
+    # onboarding/CV profile so newly registered candidates still get matched
+    # questions and plans before their first diagnostic assessment.
     assessment = await db["assessments"].find_one(
         {"user_id": user_id, "track_id": track_id},
         sort=[("created_at", -1)],
     )
-    skill_level = assessment["skill_level"] if assessment else "beginner"
+    skill_level = assessment["skill_level"] if assessment else await _profile_skill_level(user_id, db)
 
     now = datetime.now(timezone.utc)
     document = {
@@ -66,7 +84,7 @@ async def enroll(user_id: str, track_id: str, db: AsyncIOMotorDatabase) -> dict:
     document["id"] = str(insert_result.inserted_id)
 
     plan_exists = await _plan_exists(user_id, track_id, db)
-    return _attach_track_data(document, plan_exists)
+    return await _attach_track_data(document, plan_exists, db)
 
 
 async def get_enrollment(user_id: str, track_id: str, db: AsyncIOMotorDatabase) -> dict | None:
@@ -77,7 +95,7 @@ async def get_enrollment(user_id: str, track_id: str, db: AsyncIOMotorDatabase) 
 
     enrollment["id"] = str(enrollment.pop("_id"))
     plan_exists = await _plan_exists(user_id, track_id, db)
-    return _attach_track_data(enrollment, plan_exists)
+    return await _attach_track_data(enrollment, plan_exists, db)
 
 
 async def get_all_enrollments(user_id: str, db: AsyncIOMotorDatabase) -> list[dict]:
@@ -88,7 +106,7 @@ async def get_all_enrollments(user_id: str, db: AsyncIOMotorDatabase) -> list[di
     async for enrollment in cursor:
         enrollment["id"] = str(enrollment.pop("_id"))
         plan_exists = await _plan_exists(user_id, enrollment["track_id"], db)
-        enrollments.append(_attach_track_data(enrollment, plan_exists))
+        enrollments.append(await _attach_track_data(enrollment, plan_exists, db))
 
     return enrollments
 
@@ -126,7 +144,7 @@ async def update_progress(
     updated = {**enrollment, **updates}
     updated["id"] = str(updated.pop("_id"))
     plan_exists = await _plan_exists(user_id, track_id, db)
-    return _attach_track_data(updated, plan_exists)
+    return await _attach_track_data(updated, plan_exists, db)
 
 
 async def unenroll(user_id: str, track_id: str, db: AsyncIOMotorDatabase) -> None:

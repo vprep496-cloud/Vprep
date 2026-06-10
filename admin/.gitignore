@@ -5,7 +5,9 @@ build/
 next-env.d.ts
 
 # Env / secrets
+.env
 .env*.local
+!.env.example
 
 # Logs
 npm-debug.*

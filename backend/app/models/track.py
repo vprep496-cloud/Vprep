@@ -1,16 +1,10 @@
-# Stub models — expanded with full track CRUD/logic in Phase 3.
-from enum import Enum
-
 from pydantic import BaseModel
 
 
-class TrackId(str, Enum):
-    ml_ai = "ml_ai"
-    web_dev = "web_dev"
-    devops = "devops"
-    data_science = "data_science"
-    cloud = "cloud"
-    mobile_dev = "mobile_dev"
+# Tracks are now admin-extensible, so IDs are validated against the runtime
+# catalog rather than a hardcoded enum. The six built-ins still use their
+# original string ids.
+TrackId = str
 
 
 class Track(BaseModel):
@@ -20,3 +14,4 @@ class Track(BaseModel):
     icon: str
     color: str
     total_days: int
+    topic_areas: list[str] = []

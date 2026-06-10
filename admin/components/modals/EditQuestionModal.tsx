@@ -5,7 +5,7 @@ import axios from "axios";
 import { Loader2 } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
-import { ANSWER_TYPE_BY_PHASE, DIFFICULTY_OPTIONS, PHASE_OPTIONS, TRACK_OPTIONS } from "@/lib/tracks";
+import { ANSWER_TYPE_BY_PHASE, DIFFICULTY_OPTIONS, PHASE_OPTIONS, type TrackOption } from "@/lib/tracks";
 import type { AdminQuestion, Difficulty, InterviewPhase, QuestionInput, TrackId } from "@/types";
 
 interface EditQuestionModalProps {
@@ -13,6 +13,7 @@ interface EditQuestionModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess: () => void;
+  trackOptions: TrackOption[];
 }
 
 interface FormState {
@@ -68,7 +69,7 @@ function toFormState(question: AdminQuestion): FormState {
 // uses `payload.model_dump(exclude_none=True)` and re-validates the
 // *resulting* phase/answer_type combination, so a partial diff is exactly
 // what it expects (and keeps `updated_at` semantics meaningful).
-export default function EditQuestionModal({ question, isOpen, onClose, onSuccess }: EditQuestionModalProps) {
+export default function EditQuestionModal({ question, isOpen, onClose, onSuccess, trackOptions }: EditQuestionModalProps) {
   const [form, setForm] = useState<FormState>(() => toFormState(question));
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -142,7 +143,7 @@ export default function EditQuestionModal({ question, isOpen, onClose, onSuccess
                   onChange={(event) => update("trackId", event.target.value as TrackId)}
                   className={FIELD_CLASS}
                 >
-                  {TRACK_OPTIONS.map((track) => (
+                  {trackOptions.map((track) => (
                     <option key={track.id} value={track.id}>
                       {track.name}
                     </option>
@@ -170,10 +171,17 @@ export default function EditQuestionModal({ question, isOpen, onClose, onSuccess
               <p className="mt-3 text-xs text-text-muted">
                 Answer type for this phase is fixed:{" "}
                 <span className="font-semibold text-text-secondary">
-                  {derivedAnswerType === "voice" ? "Voice response" : "Typed response"}
+                  {derivedAnswerType === "voice"
+                    ? "Voice response"
+                    : derivedAnswerType === "image"
+                      ? "Image upload"
+                      : "Typed response"}
                 </span>
                 {derivedAnswerType !== question.answerType ? (
-                  <span className="text-warning"> — changing from {question.answerType === "voice" ? "voice" : "typed"}</span>
+                  <span className="text-warning">
+                    {" "}
+                    — changing from {question.answerType === "voice" ? "voice" : question.answerType === "image" ? "image" : "typed"}
+                  </span>
                 ) : null}
               </p>
             ) : null}

@@ -2,6 +2,7 @@ import axios from "axios";
 import { getSession } from "next-auth/react";
 import type {
   AdminAnalytics,
+  AIStatus,
   AdminQuestion,
   CandidateAssessment,
   CandidateDetail,
@@ -12,9 +13,12 @@ import type {
   InterviewQuestionAnswer,
   InterviewSessionResult,
   QuestionFeedback,
+  QuestionGenerateInput,
   QuestionInput,
   ScoreTrendPoint,
   SessionCompletionPoint,
+  ManualReviewInput,
+  TrackInput,
   TrackDistributionPoint,
   TrackSummary,
 } from "@/types";
@@ -69,6 +73,12 @@ interface BackendTrack {
   icon: string;
   color: string;
   total_days: number;
+  topic_areas?: string[];
+  is_active?: boolean;
+}
+
+interface BackendTracksResponse {
+  tracks: BackendTrack[];
 }
 
 interface BackendDashboardStats {
@@ -120,8 +130,16 @@ interface BackendQuestionFeedback {
   question: string;
   user_answer: string;
   score: number;
+  criteria_scores?: Record<string, number>;
+  confidence?: number | null;
+  strengths?: string[];
+  improvements?: string[];
+  review_flags?: string[];
+  evidence?: string[];
+  score_rationale?: string | null;
   feedback: string;
   model_answer: string;
+  scoring_metadata?: Record<string, unknown> | null;
 }
 
 interface BackendCandidateAssessment {
@@ -132,6 +150,7 @@ interface BackendCandidateAssessment {
   score: number;
   breakdown: Record<string, number>;
   per_question_feedback: BackendQuestionFeedback[];
+  scoring_version?: string | null;
   created_at: string;
 }
 
@@ -142,10 +161,30 @@ interface BackendQuestionAnswer {
   answer_type: InterviewQuestionAnswer["answerType"];
   transcription: string | null;
   user_text_answer: string | null;
+  answer_duration_seconds?: number | null;
   score: number;
   criteria_scores: Record<string, number>;
   feedback: string;
   model_answer: string;
+  confidence?: number | null;
+  strengths?: string[];
+  improvements?: string[];
+  review_flags?: string[];
+  evidence?: string[];
+  score_rationale?: string | null;
+  rubric_version?: string | null;
+  scoring_mode?: string | null;
+  scoring_metadata?: Record<string, unknown> | null;
+  ai_score?: number | null;
+  ai_criteria_scores?: Record<string, number> | null;
+  ai_feedback?: string | null;
+  ai_confidence?: number | null;
+  ai_review_flags?: string[];
+  ai_scoring_metadata?: Record<string, unknown> | null;
+  manual_review_status?: "pending" | "reviewed" | "not_required" | null;
+  reviewer_notes?: string | null;
+  reviewed_by?: string | null;
+  reviewed_at?: string | null;
 }
 
 interface BackendPhaseResult {
@@ -201,6 +240,11 @@ interface BackendQuestionsResponse {
   pages: number;
 }
 
+interface BackendGeneratedQuestionsResponse {
+  questions: BackendQuestion[];
+  total: number;
+}
+
 interface BackendScoreTrendPoint {
   date: string;
   average_score: number;
@@ -219,6 +263,24 @@ interface BackendAnalytics {
   session_completion: SessionCompletionPoint[]; // already flat {date, started, completed} — no snake_case fields
 }
 
+interface BackendAIStatus {
+  provider: string;
+  configured: boolean;
+  sdk: string;
+  key_fingerprint: string | null;
+  models: AIStatus["models"];
+  generation: {
+    temperature: number;
+    creative_temperature: number;
+    top_p: number;
+    max_output_tokens: number;
+  };
+  live?: {
+    ok: boolean;
+    message: string;
+  };
+}
+
 // --- snake_case -> camelCase mappers (mirrors `mobile/services/interview.service.ts`'s `to*` family) ---
 
 function toTrackSummary(track: BackendTrack | null): TrackSummary | null {
@@ -230,6 +292,8 @@ function toTrackSummary(track: BackendTrack | null): TrackSummary | null {
     icon: track.icon,
     color: track.color,
     totalDays: track.total_days,
+    topicAreas: track.topic_areas ?? [],
+    isActive: track.is_active ?? true,
   };
 }
 
@@ -270,8 +334,16 @@ function toQuestionFeedback(feedback: BackendQuestionFeedback): QuestionFeedback
     question: feedback.question,
     userAnswer: feedback.user_answer,
     score: feedback.score,
+    criteriaScores: feedback.criteria_scores ?? {},
+    confidence: feedback.confidence ?? null,
+    strengths: feedback.strengths ?? [],
+    improvements: feedback.improvements ?? [],
+    reviewFlags: feedback.review_flags ?? [],
+    evidence: feedback.evidence ?? [],
+    scoreRationale: feedback.score_rationale ?? null,
     feedback: feedback.feedback,
     modelAnswer: feedback.model_answer,
+    scoringMetadata: feedback.scoring_metadata ?? null,
   };
 }
 
@@ -284,6 +356,7 @@ function toCandidateAssessment(assessment: BackendCandidateAssessment): Candidat
     score: assessment.score,
     breakdown: assessment.breakdown,
     perQuestionFeedback: assessment.per_question_feedback.map(toQuestionFeedback),
+    scoringVersion: assessment.scoring_version ?? null,
     createdAt: assessment.created_at,
   };
 }
@@ -296,10 +369,30 @@ function toQuestionAnswer(answer: BackendQuestionAnswer): InterviewQuestionAnswe
     answerType: answer.answer_type,
     transcription: answer.transcription,
     userTextAnswer: answer.user_text_answer,
+    answerDurationSeconds: answer.answer_duration_seconds ?? null,
     score: answer.score,
     criteriaScores: answer.criteria_scores,
     feedback: answer.feedback,
     modelAnswer: answer.model_answer,
+    confidence: answer.confidence ?? null,
+    strengths: answer.strengths ?? [],
+    improvements: answer.improvements ?? [],
+    reviewFlags: answer.review_flags ?? [],
+    evidence: answer.evidence ?? [],
+    scoreRationale: answer.score_rationale ?? null,
+    rubricVersion: answer.rubric_version ?? null,
+    scoringMode: answer.scoring_mode ?? null,
+    scoringMetadata: answer.scoring_metadata ?? null,
+    aiScore: answer.ai_score ?? null,
+    aiCriteriaScores: answer.ai_criteria_scores ?? null,
+    aiFeedback: answer.ai_feedback ?? null,
+    aiConfidence: answer.ai_confidence ?? null,
+    aiReviewFlags: answer.ai_review_flags ?? [],
+    aiScoringMetadata: answer.ai_scoring_metadata ?? null,
+    manualReviewStatus: answer.manual_review_status ?? null,
+    reviewerNotes: answer.reviewer_notes ?? null,
+    reviewedBy: answer.reviewed_by ?? null,
+    reviewedAt: answer.reviewed_at ?? null,
   };
 }
 
@@ -358,6 +451,23 @@ function toTrackDistributionPoint(point: BackendTrackDistributionPoint): TrackDi
   };
 }
 
+function toAIStatus(status: BackendAIStatus): AIStatus {
+  return {
+    provider: status.provider,
+    configured: status.configured,
+    sdk: status.sdk,
+    keyFingerprint: status.key_fingerprint,
+    models: status.models,
+    generation: {
+      temperature: status.generation.temperature,
+      creativeTemperature: status.generation.creative_temperature,
+      topP: status.generation.top_p,
+      maxOutputTokens: status.generation.max_output_tokens,
+    },
+    live: status.live,
+  };
+}
+
 // --- Request param / pagination shapes shared by list endpoints ---
 
 interface PaginatedResult<T> {
@@ -404,7 +514,65 @@ function questionInputToPayload(input: Partial<QuestionInput>): Record<string, u
   return payload;
 }
 
+function questionGenerateToPayload(input: QuestionGenerateInput): Record<string, unknown> {
+  return {
+    track_id: input.trackId,
+    phase: input.phase,
+    count: input.count,
+    ...(input.difficulty ? { difficulty: input.difficulty } : {}),
+    ...(input.guidance ? { guidance: input.guidance } : {}),
+  };
+}
+
+function trackInputToPayload(input: Partial<TrackInput>): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  if (input.id !== undefined) payload.id = input.id;
+  if (input.name !== undefined) payload.name = input.name;
+  if (input.description !== undefined) payload.description = input.description;
+  if (input.icon !== undefined) payload.icon = input.icon;
+  if (input.color !== undefined) payload.color = input.color;
+  if (input.totalDays !== undefined) payload.total_days = input.totalDays;
+  if (input.topicAreas !== undefined) payload.topic_areas = input.topicAreas;
+  return payload;
+}
+
+function manualReviewToPayload(input: ManualReviewInput): Record<string, unknown> {
+  const payload: Record<string, unknown> = {};
+  if (input.score !== undefined) payload.score = input.score;
+  if (input.criteriaScores !== undefined) payload.criteria_scores = input.criteriaScores;
+  if (input.feedback !== undefined) payload.feedback = input.feedback;
+  if (input.reviewerNotes !== undefined) payload.reviewer_notes = input.reviewerNotes;
+  if (input.status !== undefined) payload.status = input.status;
+  return payload;
+}
+
 export const adminApi = {
+  async getAIStatus(liveCheck = false): Promise<AIStatus> {
+    const { data } = await api.get<BackendAIStatus>("/api/v1/admin/ai/status", {
+      params: liveCheck ? { live_check: true } : undefined,
+    });
+    return toAIStatus(data);
+  },
+
+  async getTracks(): Promise<TrackSummary[]> {
+    const { data } = await api.get<BackendTracksResponse>("/api/v1/admin/tracks");
+    return data.tracks.map((track) => toTrackSummary(track)).filter(Boolean) as TrackSummary[];
+  },
+
+  async createTrack(input: TrackInput): Promise<TrackSummary> {
+    const { data } = await api.post<BackendTrack>("/api/v1/admin/tracks", trackInputToPayload(input));
+    return toTrackSummary(data) as TrackSummary;
+  },
+
+  async updateTrack(trackId: string, input: Partial<TrackInput>): Promise<TrackSummary> {
+    const { data } = await api.put<BackendTrack>(`/api/v1/admin/tracks/${trackId}`, trackInputToPayload(input));
+    return toTrackSummary(data) as TrackSummary;
+  },
+
+  async deleteTrack(trackId: string): Promise<void> {
+    await api.delete(`/api/v1/admin/tracks/${trackId}`);
+  },
+
   async getStats(): Promise<DashboardStats> {
     const { data } = await api.get<BackendDashboardStats>("/api/v1/admin/stats");
     return {
@@ -482,6 +650,14 @@ export const adminApi = {
     return toAdminQuestion(data);
   },
 
+  async generateQuestions(input: QuestionGenerateInput): Promise<AdminQuestion[]> {
+    const { data } = await api.post<BackendGeneratedQuestionsResponse>(
+      "/api/v1/admin/questions/generate",
+      questionGenerateToPayload(input)
+    );
+    return data.questions.map(toAdminQuestion);
+  },
+
   async updateQuestion(questionId: string, input: Partial<QuestionInput>): Promise<AdminQuestion> {
     const { data } = await api.put<BackendQuestion>(
       `/api/v1/admin/questions/${questionId}`,
@@ -510,6 +686,18 @@ export const adminApi = {
 
   async getSession(sessionId: string): Promise<InterviewSessionResult> {
     const { data } = await api.get<BackendSessionResult>(`/api/v1/admin/sessions/${sessionId}`);
+    return toSessionResult(data);
+  },
+
+  async reviewAnswer(
+    sessionId: string,
+    questionId: string,
+    input: ManualReviewInput
+  ): Promise<InterviewSessionResult> {
+    const { data } = await api.put<BackendSessionResult>(
+      `/api/v1/admin/sessions/${sessionId}/answers/${questionId}/review`,
+      manualReviewToPayload(input)
+    );
     return toSessionResult(data);
   },
 };

@@ -9,6 +9,7 @@ interface SessionHistoryTableProps {
   sessions: InterviewSessionResult[];
   loading?: boolean;
   onReview: (session: InterviewSessionResult) => void;
+  trackNames?: Record<string, string>;
 }
 
 // `MODE_LABELS` mirrors the mobile app's
@@ -17,7 +18,7 @@ interface SessionHistoryTableProps {
 // `lib/tracks.ts` for reuse across the question modals/filters too).
 const MODE_LABELS: Record<string, string> = {
   hr: "HR Only",
-  technical: "Technical Only",
+  technical: "Technical + Coding",
   behavioral: "Behavioral Only",
   full_mock: "Full Mock",
 };
@@ -33,7 +34,7 @@ function formatDuration(totalSeconds: number): string {
 // tab. Read-only summary rows; the "Review" action opens the admin session
 // review modal (`adminApi.getSession`, full transcript + per-answer scoring —
 // spec: "Admins can review any session including voice transcriptions").
-export default function SessionHistoryTable({ sessions, loading = false, onReview }: SessionHistoryTableProps) {
+export default function SessionHistoryTable({ sessions, loading = false, onReview, trackNames = TRACK_NAMES }: SessionHistoryTableProps) {
   const columns: DataTableColumn<InterviewSessionResult>[] = [
     {
       key: "completedAt",
@@ -48,7 +49,7 @@ export default function SessionHistoryTable({ sessions, loading = false, onRevie
     {
       key: "trackId",
       label: "Track",
-      render: (session) => TRACK_NAMES[session.trackId] ?? session.trackId,
+      render: (session) => trackNames[session.trackId] ?? session.trackId,
     },
     {
       key: "mode",

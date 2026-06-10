@@ -4,14 +4,15 @@ import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
 import axios from "axios";
-import { AlertTriangle, Eye, Loader2, Pencil, Plus, Trash2 } from "lucide-react";
+import { AlertTriangle, Eye, Loader2, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
-import { PHASE_OPTIONS, TRACK_NAMES, TRACK_OPTIONS } from "@/lib/tracks";
+import { PHASE_OPTIONS, TRACK_NAMES, TRACK_OPTIONS, type TrackOption } from "@/lib/tracks";
 import DataTable, { type DataTableColumn } from "@/components/ui/DataTable";
 import PageHeader from "@/components/ui/PageHeader";
 import AddQuestionModal from "@/components/modals/AddQuestionModal";
 import EditQuestionModal from "@/components/modals/EditQuestionModal";
+import GenerateQuestionsModal from "@/components/modals/GenerateQuestionsModal";
 import type { AdminQuestion } from "@/types";
 
 const PAGE_SIZE = 25;
@@ -27,6 +28,7 @@ const DIFFICULTY_STYLES: Record<string, string> = {
 const PHASE_STYLES: Record<string, string> = {
   hr: "bg-sky-500/15 text-sky-400",
   technical: "bg-purple-500/15 text-purple-400",
+  coding_logic: "bg-amber-500/15 text-amber-400",
   behavioral: "bg-success/15 text-success",
 };
 
@@ -67,7 +69,7 @@ function DeleteQuestionDialog({
           <h2 className="text-lg font-bold text-text-primary">Delete Question</h2>
           <p className="mt-2 text-sm text-text-secondary">
             This permanently removes &ldquo;{question.questionText.slice(0, 96)}
-            {question.questionText.length > 96 ? "…" : ""}&rdquo; from the {TRACK_NAMES[question.trackId] ?? question.trackId} bank.
+            {question.questionText.length > 96 ? "…" : ""}&rdquo; from the question bank.
           </p>
           <p className="mt-3 rounded-xl bg-warning/10 px-3 py-2.5 text-sm text-warning">
             This cannot be undone. Questions already used in a completed interview can&apos;t be deleted.
@@ -115,6 +117,7 @@ export default function QuestionsPage() {
   const [phaseFilter, setPhaseFilter] = useState<string>("all");
   const [trackFilter, setTrackFilter] = useState<string>("all");
   const [isAddOpen, setIsAddOpen] = useState(false);
+  const [isGenerateOpen, setIsGenerateOpen] = useState(false);
   const [editingQuestion, setEditingQuestion] = useState<AdminQuestion | null>(null);
   const [deletingQuestion, setDeletingQuestion] = useState<AdminQuestion | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
@@ -129,10 +132,31 @@ export default function QuestionsPage() {
         trackId: trackFilter !== "all" ? trackFilter : undefined,
       }),
   });
+  const { data: tracks } = useQuery({
+    queryKey: ["admin-tracks"],
+    queryFn: adminApi.getTracks,
+  });
 
   const questions = useMemo(() => data?.items ?? [], [data]);
   const total = data?.total ?? 0;
   const pages = data?.pages ?? 1;
+  const trackOptions: TrackOption[] = useMemo(
+    () => [
+      TRACK_OPTIONS[0],
+      ...((tracks ?? TRACK_OPTIONS.filter((track) => track.id !== "all")).map((track) => ({
+        id: track.id,
+        name: track.name,
+      }))),
+    ],
+    [tracks]
+  );
+  const trackNames = useMemo(
+    () => ({
+      ...TRACK_NAMES,
+      ...Object.fromEntries(trackOptions.map((track) => [track.id, track.name])),
+    }),
+    [trackOptions]
+  );
 
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["admin-questions"] });
 
@@ -159,7 +183,7 @@ export default function QuestionsPage() {
     {
       key: "trackId",
       label: "Track",
-      render: (question) => <span className="text-text-secondary">{TRACK_NAMES[question.trackId] ?? question.trackId}</span>,
+      render: (question) => <span className="text-text-secondary">{trackNames[question.trackId] ?? question.trackId}</span>,
     },
     {
       key: "phase",
@@ -184,7 +208,9 @@ export default function QuestionsPage() {
       key: "answerType",
       label: "Answer",
       render: (question) => (
-        <span className="text-xs text-text-muted">{question.answerType === "voice" ? "Voice" : "Typed"}</span>
+        <span className="text-xs text-text-muted">
+          {question.answerType === "voice" ? "Voice" : question.answerType === "image" ? "Image" : "Typed"}
+        </span>
       ),
     },
     {
@@ -225,14 +251,24 @@ export default function QuestionsPage() {
         description="Browse every interview question across all tracks and phases."
         actions={
           isSuperadmin ? (
-            <button
-              type="button"
-              onClick={() => setIsAddOpen(true)}
-              className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600"
-            >
-              <Plus size={16} />
-              Add Question
-            </button>
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setIsGenerateOpen(true)}
+                className="flex items-center gap-2 rounded-xl border border-border px-4 py-2.5 text-sm font-semibold text-text-secondary transition-colors hover:bg-background-surface hover:text-text-primary"
+              >
+                <Sparkles size={16} />
+                Generate
+              </button>
+              <button
+                type="button"
+                onClick={() => setIsAddOpen(true)}
+                className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600"
+              >
+                <Plus size={16} />
+                Add Question
+              </button>
+            </div>
           ) : null
         }
       />
@@ -276,7 +312,7 @@ export default function QuestionsPage() {
           className="rounded-xl border border-border bg-background-card px-3 py-2.5 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500"
         >
           <option value="all">All tracks</option>
-          {TRACK_OPTIONS.map((track) => (
+          {trackOptions.map((track) => (
             <option key={track.id} value={track.id}>
               {track.name}
             </option>
@@ -319,7 +355,20 @@ export default function QuestionsPage() {
           render otherwise) — so this isn't a "render but gate" pattern, the
           superadmin-only surfaces simply don't exist in the DOM for admins. */}
       {isAddOpen ? (
-        <AddQuestionModal isOpen={isAddOpen} onClose={() => setIsAddOpen(false)} onSuccess={invalidate} />
+        <AddQuestionModal
+          isOpen={isAddOpen}
+          onClose={() => setIsAddOpen(false)}
+          onSuccess={invalidate}
+          trackOptions={trackOptions}
+        />
+      ) : null}
+      {isGenerateOpen ? (
+        <GenerateQuestionsModal
+          isOpen={isGenerateOpen}
+          onClose={() => setIsGenerateOpen(false)}
+          onSuccess={() => invalidate()}
+          trackOptions={trackOptions}
+        />
       ) : null}
       {editingQuestion ? (
         <EditQuestionModal
@@ -327,6 +376,7 @@ export default function QuestionsPage() {
           isOpen={!!editingQuestion}
           onClose={() => setEditingQuestion(null)}
           onSuccess={invalidate}
+          trackOptions={trackOptions}
         />
       ) : null}
       {deletingQuestion ? (

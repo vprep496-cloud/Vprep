@@ -10,12 +10,10 @@ from app.services import enrollment_service
 
 router = APIRouter()
 
-# Static track catalog — tracks never change, so they live as a hardcoded list
-# rather than a MongoDB collection. `topic_areas` is fed directly into the
-# Gemini prompts in assessment_service.py (imported via TRACKS_BY_ID below).
-# Icon/color/total_days values mirror the placeholder data already shown on
-# the mobile Tracks screen so the UI stays visually consistent end to end.
-TRACKS: list[dict] = [
+# Built-in track catalog. Admin-created tracks live in MongoDB and are merged
+# with these defaults by `get_track_catalog`; a database document with the same
+# id overrides the built-in entry.
+DEFAULT_TRACKS: list[dict] = [
     {
         "id": "ml_ai",
         "name": "ML & AI",
@@ -132,15 +130,51 @@ TRACKS: list[dict] = [
     },
 ]
 
-# O(1) lookup by id — reused by assessment_service.py to build Gemini prompts
-# (track name + topic_areas) without a second source of truth.
-TRACKS_BY_ID: dict[str, dict] = {track["id"]: track for track in TRACKS}
+# Backwards-compatible aliases for scripts/imports that only need the built-in
+# catalog. Runtime validation should use `get_tracks_by_id(db)` instead.
+TRACKS = DEFAULT_TRACKS
+TRACKS_BY_ID: dict[str, dict] = {track["id"]: track for track in DEFAULT_TRACKS}
+
+
+def _serialize_track(document: dict) -> dict:
+    track = {key: value for key, value in document.items() if key != "_id"}
+    track.setdefault("topic_areas", [])
+    track.setdefault("is_active", True)
+    return track
+
+
+async def get_track_catalog(db: AsyncIOMotorDatabase) -> list[dict]:
+    """Return built-in tracks plus active admin-created/overridden tracks."""
+    merged: dict[str, dict] = {track["id"]: {**track, "is_active": True} for track in DEFAULT_TRACKS}
+
+    cursor = db["tracks"].find({}).sort("name", 1)
+    async for document in cursor:
+        track = _serialize_track(document)
+        if track.get("is_active") is False:
+            merged.pop(track["id"], None)
+            continue
+        merged[track["id"]] = track
+
+    return sorted(merged.values(), key=lambda track: track["name"].lower())
+
+
+async def get_tracks_by_id(db: AsyncIOMotorDatabase) -> dict[str, dict]:
+    tracks = await get_track_catalog(db)
+    return {track["id"]: track for track in tracks}
+
+
+async def get_track_or_none(track_id: str, db: AsyncIOMotorDatabase) -> dict | None:
+    tracks_by_id = await get_tracks_by_id(db)
+    return tracks_by_id.get(track_id)
 
 
 @router.get("/")
-async def list_tracks(_current_user: dict = Depends(get_current_user)):
-    """Return the full static track catalog. Any authenticated user."""
-    return TRACKS
+async def list_tracks(
+    _current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Return the full track catalog. Any authenticated user."""
+    return await get_track_catalog(db)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +195,7 @@ async def enroll_in_track(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Enroll the current user in a track. Idempotent — see enrollment_service.enroll."""
-    if payload.track_id not in TRACKS_BY_ID:
+    if await get_track_or_none(payload.track_id, db) is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
 
     enrollment = await enrollment_service.enroll(current_user["id"], payload.track_id, db)
@@ -229,9 +263,10 @@ async def unenroll_from_track(
 async def get_track(
     track_id: str,
     _current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Return a single track by ID, or 404 if the ID is not one of the six tracks."""
-    track = TRACKS_BY_ID.get(track_id)
+    """Return a single track by ID, or 404 if the ID is unknown/inactive."""
+    track = await get_track_or_none(track_id, db)
     if track is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
     return track

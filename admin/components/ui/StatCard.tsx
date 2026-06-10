@@ -21,9 +21,9 @@ interface StatCardProps {
 
 export default function StatCard({ label, value, icon: Icon, loading = false }: StatCardProps) {
   return (
-    <div className="rounded-2xl border border-border bg-background-card p-5">
-      <div className="mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-primary-500/15">
-        <Icon size={20} className="text-primary-400" />
+    <div className="rounded-2xl border border-border-soft bg-background-card p-5 shadow-soft transition-shadow hover:shadow-lift">
+      <div className="mb-4 flex h-11 w-11 items-center justify-center rounded-xl bg-primary-50">
+        <Icon size={20} className="text-primary-600" />
       </div>
       {loading ? (
         <>

@@ -5,7 +5,6 @@ import { useQuery } from "@tanstack/react-query";
 import { Activity, BarChart3, TrendingUp } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
-import { TRACK_OPTIONS } from "@/lib/tracks";
 import PageHeader from "@/components/ui/PageHeader";
 import ScoreTrendChart from "@/components/charts/ScoreTrendChart";
 import TrackDistributionChart from "@/components/charts/TrackDistributionChart";
@@ -74,6 +73,10 @@ export default function AnalyticsPage() {
     queryKey: ["admin-analytics", { days, trackFilter }],
     queryFn: () => adminApi.getAnalytics({ days, trackId: trackFilter !== "all" ? trackFilter : undefined }),
   });
+  const { data: tracks } = useQuery({
+    queryKey: ["admin-tracks"],
+    queryFn: adminApi.getTracks,
+  });
 
   return (
     <div>
@@ -103,7 +106,7 @@ export default function AnalyticsPage() {
               className="rounded-xl border border-border bg-background-card px-3 py-2.5 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500"
             >
               <option value="all">All tracks</option>
-              {TRACK_OPTIONS.map((track) => (
+              {(tracks ?? []).map((track) => (
                 <option key={track.id} value={track.id}>
                   {track.name}
                 </option>

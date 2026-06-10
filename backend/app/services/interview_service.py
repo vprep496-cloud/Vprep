@@ -4,51 +4,47 @@
 # ownership checks, and persistence orchestration — mirroring the Phase 3/4
 # service/router split (assessment_service.py / enrollment_service.py).
 import base64
-import json
 import logging
-import random
 from datetime import datetime, timezone
+from typing import Any
 
-import google.generativeai as genai
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.models.enrollment import EnrollmentProgress
-from app.services import enrollment_service
-from app.services.gemini import generate_json, model
+from app.services import admin_ai_service, enrollment_service
+from app.services.profile_service import normalize_level
+from app.services.scoring_engine import (
+    RUBRIC_VERSION,
+    score_assessment_batch,
+    score_interview_audio,
+    score_interview_image,
+    score_interview_text,
+)
 
 logger = logging.getLogger("vprep.interview_service")
 
 VALID_MODES = {"hr", "technical", "behavioral", "full_mock"}
 
 # Which phases each mode includes, and in what order they run. Full Mock runs
-# them sequentially — HR, then Technical, then Behavioral — per the spec table.
+# them sequentially — HR, then Technical, then Coding Logic, then Behavioral.
+# The product's "technical phase" includes both conceptual short answers and
+# handwritten coding-logic uploads, so `coding_logic` is an internal phase key.
 PHASES_BY_MODE: dict[str, list[str]] = {
     "hr": ["hr"],
-    "technical": ["technical"],
+    "technical": ["technical", "coding_logic"],
     "behavioral": ["behavioral"],
-    "full_mock": ["hr", "technical", "behavioral"],
+    "full_mock": ["hr", "technical", "coding_logic", "behavioral"],
 }
 
-_QUESTION_COUNT_BY_PHASE = {"hr": 4, "technical": 5, "behavioral": 4}
+_QUESTION_COUNT_BY_PHASE = {"hr": 4, "technical": 4, "coding_logic": 1, "behavioral": 4}
 
 # complete_session's weighted-average rule. When a phase is absent (HR Only,
 # Technical Only, Behavioral Only sessions), its weight is redistributed
 # equally among the phases that ARE present — see _phase_weights below.
-_BASE_PHASE_WEIGHTS = {"hr": 0.30, "technical": 0.50, "behavioral": 0.20}
-
-# Required JSON-only tail, mirroring assessment_service.py's Gemini Prompt
-# Rule #1 suffix — generate_json() also appends its own, the two stack fine.
-_JSON_ONLY_SUFFIX = (
-    "\n\nRespond ONLY with valid JSON. No markdown, no backticks, no preamble, "
-    "no explanation. Start immediately with `{`."
-)
-_RETRY_SUFFIX = (
-    "\n\nYour previous response was not valid JSON. Output ONLY raw JSON this time."
-)
-
+_BASE_PHASE_WEIGHTS = {"hr": 0.30, "technical": 0.35, "coding_logic": 0.15, "behavioral": 0.20}
 
 # ---------------------------------------------------------------------------
 # Question sanitization / sampling
@@ -65,113 +61,287 @@ def sanitize_question(question: dict) -> dict:
     return {key: value for key, value in question.items() if key not in ("model_answer", "_id")}
 
 
-async def _sample_questions(
-    db: AsyncIOMotorDatabase, phase: str, track_id: str, count: int
-) -> list[dict]:
-    """Randomly sample `count` questions for a phase via Mongo's `$sample`.
-
-    HR and Behavioral questions are track-agnostic (`track_id: "all"` in the
-    seed data); Technical questions are filtered to the candidate's own track.
-    """
-    query_track_id = "all" if phase in ("hr", "behavioral") else track_id
-    pipeline = [
-        {"$match": {"phase": phase, "track_id": query_track_id}},
-        {"$sample": {"size": count}},
-    ]
-
-    questions: list[dict] = []
-    async for document in db["questions"].aggregate(pipeline):
-        document["id"] = str(document.pop("_id"))
-        questions.append(document)
-    return questions
+def _serialize_question(document: dict) -> dict:
+    serialized = dict(document)
+    serialized["id"] = str(serialized.pop("_id"))
+    return serialized
 
 
-# ---------------------------------------------------------------------------
-# Gemini prompt builders + a small local JSON parser for multimodal responses
-#
-# `generate_json()` in gemini.py only accepts a plain text prompt — voice
-# scoring needs a multimodal `[audio_part, text_part]` content list, so it
-# can't go through that helper. `_parse_json_response` below intentionally
-# duplicates gemini.py's small fence-stripping/parsing logic (rather than
-# reaching into its private `_strip_code_fences`) to keep that Phase 1 file
-# untouched, exactly as Agent Rule #1 requires.
-# ---------------------------------------------------------------------------
+def _question_track_filter(phase: str, track_id: str) -> str | dict:
+    # HR/Behavioral prompts are reusable across tracks, while technical prompts
+    # stay track-specific. Coding logic accepts both reusable and track prompts.
+    return {"$in": ["all", track_id]} if phase in ("hr", "behavioral", "coding_logic") else track_id
 
 
-def _parse_json_response(raw_text: str) -> dict:
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[1] if "\n" in cleaned else cleaned[3:]
-    if cleaned.endswith("```"):
-        cleaned = cleaned.rsplit("```", 1)[0]
-    cleaned = cleaned.strip()
-
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        snippet = raw_text.strip()[:300]
-        logger.error("Gemini returned non-JSON output: %s", snippet)
-        raise ValueError(f"Gemini did not return valid JSON. Raw response: {snippet!r}") from exc
-
-
-def _criteria_schema_snippet(criteria: list[str]) -> str:
-    return ", ".join(f'"{criterion}": 8' for criterion in criteria)
-
-
-def _build_voice_scoring_prompt(question: dict, criteria: list[str]) -> str:
-    criteria_list = ", ".join(criteria)
-    return (
-        "You are an experienced interviewer scoring a candidate's SPOKEN answer "
-        "to a mock-interview question. An audio recording of their answer is "
-        "attached to this message.\n\n"
-        f'Interview question: "{question["question_text"]}"\n'
-        f'Reference model answer (server-side scoring rubric — never shown to '
-        f'the candidate before now): {question["model_answer"]}\n'
-        f"Scoring criteria: {criteria_list}\n\n"
-        "Steps:\n"
-        "1. First, transcribe the audio EXACTLY as spoken — a faithful, verbatim "
-        "transcription including filler words and false starts where audible.\n"
-        "2. Then score the candidate's spoken answer against the reference "
-        f"answer and each of these criteria, independently, on a scale of 0 to "
-        f"10: {criteria_list}.\n"
-        "3. Compute an overall_score as the average of the criteria scores, "
-        "scaled to a 0-100 range (average out of 10, multiplied by 10, rounded "
-        "to the nearest whole number).\n"
-        "4. Write 1-2 sentences of constructive feedback.\n\n"
-        "Respond with strict JSON only, using exactly this schema:\n"
-        "{\n"
-        '  "transcription": "...",\n'
-        '  "overall_score": 78,\n'
-        f'  "criteria_scores": {{{_criteria_schema_snippet(criteria)}}},\n'
-        '  "feedback": "...",\n'
-        '  "model_answer": "..."\n'
-        "}" + _JSON_ONLY_SUFFIX
+def _difficulty_for_skill_level(skill_level: str) -> str:
+    return {"beginner": "easy", "intermediate": "medium", "advanced": "hard"}.get(
+        normalize_level(skill_level),
+        "medium",
     )
 
 
-def _build_text_scoring_prompt(question: dict, text_answer: str) -> str:
-    criteria = question.get("scoring_criteria", [])
-    criteria_list = ", ".join(criteria)
+async def _sample_questions(
+    db: AsyncIOMotorDatabase,
+    phase: str,
+    track_id: str,
+    count: int,
+    preferred_difficulty: str | None = None,
+) -> list[dict]:
+    """Randomly sample `count` questions for a phase via Mongo's `$sample`.
+
+    HR and Behavioral can be track-agnostic (`track_id: "all"`) or tied to a
+    custom track. Technical/Coding Logic prefer the candidate's track but also
+    accept "all" fallback questions for reusable logic prompts.
+    """
+    questions: list[dict] = []
+
+    async def run_sample(extra_match: dict | None = None, remaining: int = count) -> None:
+        if remaining <= 0:
+            return
+        match: dict[str, Any] = {"phase": phase, "track_id": _question_track_filter(phase, track_id)}
+        if extra_match:
+            match.update(extra_match)
+        if questions:
+            match["_id"] = {"$nin": [ObjectId(question["id"]) for question in questions]}
+
+        pipeline = [{"$match": match}, {"$sample": {"size": remaining}}]
+        async for document in db["questions"].aggregate(pipeline):
+            questions.append(_serialize_question(document))
+
+    if preferred_difficulty:
+        await run_sample({"difficulty": preferred_difficulty}, count)
+    await run_sample(None, count - len(questions))
+
+    return questions
+
+
+async def _candidate_profile_for_interview(
+    user_id: str,
+    track_id: str,
+    db: AsyncIOMotorDatabase,
+) -> dict[str, Any]:
+    user: dict | None = None
+    try:
+        user = await db["users"].find_one({"_id": ObjectId(user_id)})
+    except (InvalidId, TypeError):
+        user = None
+
+    enrollment = await db["enrollments"].find_one({"user_id": user_id, "track_id": track_id})
+    raw_profile = user.get("profile") if user else {}
+    profile = raw_profile if isinstance(raw_profile, dict) else {}
+
+    skill_level = (
+        (enrollment or {}).get("skill_level")
+        or (user or {}).get("normalized_level")
+        or profile.get("normalized_level")
+        or (user or {}).get("self_reported_level")
+        or profile.get("self_reported_level")
+        or "beginner"
+    )
+
+    return {
+        "skill_level": normalize_level(skill_level),
+        "target_role": (user or {}).get("target_role") or profile.get("target_role"),
+        "skills": profile.get("skills") if isinstance(profile.get("skills"), list) else [],
+        "primary_roles": profile.get("primary_roles") if isinstance(profile.get("primary_roles"), list) else [],
+        "profile_confidence": profile.get("confidence"),
+    }
+
+
+def _auto_fill_guidance(phase: str, candidate_profile: dict[str, Any]) -> str:
+    skills = ", ".join(str(skill) for skill in candidate_profile.get("skills", [])[:8])
+    roles = ", ".join(str(role) for role in candidate_profile.get("primary_roles", [])[:4])
+    target_role = candidate_profile.get("target_role")
+    level = candidate_profile["skill_level"]
+
     return (
-        "You are an experienced interviewer scoring a candidate's TYPED answer "
-        "to a technical mock-interview question.\n\n"
-        f'Interview question: "{question["question_text"]}"\n'
-        f"Reference model answer (server-side scoring rubric — never shown to "
-        f'the candidate before now): {question["model_answer"]}\n'
-        f"Scoring criteria: {criteria_list}\n\n"
-        f'Candidate\'s typed answer: "{text_answer}"\n\n'
-        f"Score the answer against each of these criteria independently, on a "
-        f"scale of 0 to 10: {criteria_list}. Compute an overall_score as the "
-        "average of the criteria scores, scaled to a 0-100 range (average out "
-        "of 10, multiplied by 10, rounded to the nearest whole number). Write "
-        "1-2 sentences of constructive feedback.\n\n"
-        "Respond with strict JSON only, using exactly this schema:\n"
-        "{\n"
-        '  "overall_score": 82,\n'
-        f'  "criteria_scores": {{{_criteria_schema_snippet(criteria)}}},\n'
-        '  "feedback": "...",\n'
-        '  "model_answer": "..."\n'
-        "}" + _JSON_ONLY_SUFFIX
+        f"Auto-fill a reusable question-bank shortage for {level}-level candidates. "
+        f"Target role context: {target_role or roles or 'general candidate for this track'}. "
+        f"Relevant skills to reflect when useful: {skills or 'use the track topic areas'}. "
+        "Do not include candidate names, employers, schools, or any personal identifiers. "
+        "Create professional interview questions that can safely be reused for similar candidates. "
+        f"Phase needing questions: {phase}."
+    )
+
+
+def _fallback_question_documents(
+    track: dict,
+    phase: str,
+    count: int,
+    difficulty: str,
+    candidate_profile: dict[str, Any],
+) -> list[dict]:
+    topics = track.get("topic_areas") or [track.get("name", "the role")]
+    track_name = track.get("name", "this track")
+    level = candidate_profile["skill_level"]
+    target_role = candidate_profile.get("target_role") or f"{track_name} role"
+
+    answer_type = "image" if phase == "coding_logic" else "voice" if phase in {"hr", "behavioral"} else "text"
+    criteria_by_phase = {
+        "hr": ["communication_clarity", "question_relevance", "structure", "professionalism", "role_alignment"],
+        "technical": ["technical_correctness", "depth_of_understanding", "reasoning_quality", "terminology"],
+        "coding_logic": ["problem_understanding", "algorithm_correctness", "edge_cases", "complexity_awareness"],
+        "behavioral": ["situation_context", "action_ownership", "result_impact", "reflection_learning"],
+    }
+
+    hr_questions = [
+        f"Walk me through your background and why you are preparing for a {target_role}.",
+        f"What makes you interested in {track_name}, and how does it connect to your recent learning or work?",
+        "Describe a strength you would bring to a team and a skill you are actively improving.",
+        "Tell me about a time you had to explain a complex idea clearly to someone else.",
+    ]
+    behavioral_questions = [
+        "Tell me about a time you handled feedback on your work. What changed afterward?",
+        "Describe a situation where you had to collaborate under pressure. What did you do?",
+        "Tell me about a mistake or missed expectation and how you recovered from it.",
+        "Describe a time you took ownership of a problem without waiting to be asked.",
+    ]
+
+    documents: list[dict] = []
+    for index in range(count):
+        topic = topics[index % len(topics)]
+        if phase == "technical":
+            question_text = (
+                f"Explain {topic} in the context of {track_name}. What tradeoffs, "
+                "failure modes, or practical implementation details should an interviewer expect?"
+            )
+            model_answer = (
+                f"A strong {level} answer defines the concept accurately, explains why it matters, "
+                "gives a practical example, mentions tradeoffs or edge cases, and uses correct terminology."
+            )
+        elif phase == "coding_logic":
+            question_text = (
+                "Handwrite an algorithm to process a list of inputs, detect duplicates, and return the "
+                "unique values in stable order. Include time/space complexity and at least two edge cases."
+            )
+            model_answer = (
+                "A strong solution uses a set for seen values, preserves insertion order in the output, "
+                "handles empty input and repeated values, and explains O(n) time with O(n) extra space."
+            )
+        elif phase == "behavioral":
+            question_text = behavioral_questions[index % len(behavioral_questions)]
+            model_answer = (
+                "A strong answer uses STAR structure, makes the candidate's own actions clear, includes "
+                "a concrete result, and reflects on what they learned."
+            )
+        else:
+            question_text = hr_questions[index % len(hr_questions)]
+            model_answer = (
+                "A strong answer is clear, specific, professionally toned, aligned to the target role, "
+                "and avoids vague claims without examples."
+            )
+
+        documents.append(
+            {
+                "track_id": track["id"] if phase not in {"hr", "behavioral"} else "all",
+                "phase": phase,
+                "question_text": question_text,
+                "answer_type": answer_type,
+                "difficulty": difficulty,
+                "scoring_criteria": criteria_by_phase[phase],
+                "model_answer": model_answer,
+                "tags": ["auto_fill", "fallback", phase, level, track["id"]],
+            }
+        )
+    return documents
+
+
+async def _auto_fill_missing_questions(
+    db: AsyncIOMotorDatabase,
+    phase: str,
+    track_id: str,
+    missing_count: int,
+    difficulty: str,
+    candidate_profile: dict[str, Any],
+) -> list[dict]:
+    from app.api.v1.tracks import get_track_or_none
+
+    track = await get_track_or_none(track_id, db)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
+
+    generate_count = missing_count if phase == "coding_logic" else max(missing_count, 3)
+    guidance = _auto_fill_guidance(phase, candidate_profile)
+
+    try:
+        documents = await admin_ai_service.generate_question_documents(
+            track,
+            phase,
+            generate_count,
+            difficulty,
+            guidance,
+        )
+        source = "ai_auto_fill"
+    except Exception as exc:
+        logger.warning(
+            "Gemini question auto-fill failed; using local fallback. phase=%s track_id=%s error=%s",
+            phase,
+            track_id,
+            exc,
+        )
+        documents = _fallback_question_documents(track, phase, missing_count, difficulty, candidate_profile)
+        source = "local_auto_fill"
+
+    now = datetime.now(timezone.utc)
+    enriched = [
+        {
+            **document,
+            "source": source,
+            "skill_level": candidate_profile["skill_level"],
+            "created_at": now,
+            "updated_at": now,
+        }
+        for document in documents
+    ]
+
+    result = await db["questions"].insert_many(enriched)
+    created: list[dict] = []
+    for document, inserted_id in zip(enriched, result.inserted_ids):
+        created.append({**document, "id": str(inserted_id)})
+    return created[:missing_count]
+
+
+async def _ensure_question_supply(
+    db: AsyncIOMotorDatabase,
+    phase: str,
+    track_id: str,
+    count: int,
+    candidate_profile: dict[str, Any],
+) -> list[dict]:
+    difficulty = _difficulty_for_skill_level(candidate_profile["skill_level"])
+    sampled = await _sample_questions(db, phase, track_id, count, preferred_difficulty=difficulty)
+    if len(sampled) >= count:
+        return sampled
+
+    missing = count - len(sampled)
+    logger.info(
+        "Auto-filling question shortage: phase=%s track_id=%s wanted=%d got=%d level=%s difficulty=%s",
+        phase,
+        track_id,
+        count,
+        len(sampled),
+        candidate_profile["skill_level"],
+        difficulty,
+    )
+    generated = await _auto_fill_missing_questions(
+        db,
+        phase,
+        track_id,
+        missing,
+        difficulty,
+        candidate_profile,
+    )
+    combined = [*sampled, *generated]
+    if len(combined) >= count:
+        return combined[:count]
+
+    resampled = await _sample_questions(db, phase, track_id, count, preferred_difficulty=difficulty)
+    if len(resampled) >= count:
+        return resampled
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Not enough interview questions are available right now. Please try again shortly.",
     )
 
 
@@ -185,6 +355,12 @@ def _audio_mime_type(audio_format: str | None) -> str:
     if audio_format and "wav" in audio_format.lower():
         return "audio/wav"
     return "audio/m4a"
+
+
+def _image_mime_type(image_mime_type: str | None) -> str:
+    if image_mime_type in {"image/png", "image/webp", "image/heic", "image/heif"}:
+        return image_mime_type
+    return "image/jpeg"
 
 
 # ---------------------------------------------------------------------------
@@ -201,20 +377,17 @@ async def start_session(user_id: str, track_id: str, mode: str, db: AsyncIOMotor
 
     phases = PHASES_BY_MODE[mode]
     questions_by_phase: dict[str, list[dict]] = {}
+    candidate_profile = await _candidate_profile_for_interview(user_id, track_id, db)
 
     for phase in phases:
         count = _QUESTION_COUNT_BY_PHASE[phase]
-        sampled = await _sample_questions(db, phase, track_id, count)
-        if len(sampled) < count:
-            logger.error(
-                "Question bank shortage: phase=%s track_id=%s wanted=%d got=%d",
-                phase, track_id, count, len(sampled),
-            )
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Not enough interview questions are available right now. Please try again shortly.",
-            )
-        questions_by_phase[phase] = sampled
+        questions_by_phase[phase] = await _ensure_question_supply(
+            db,
+            phase,
+            track_id,
+            count,
+            candidate_profile,
+        )
 
     now = datetime.now(timezone.utc)
     document = {
@@ -223,6 +396,11 @@ async def start_session(user_id: str, track_id: str, mode: str, db: AsyncIOMotor
         "mode": mode,
         "phases": phases,
         "questions_by_phase": questions_by_phase,
+        "candidate_profile_snapshot": {
+            "skill_level": candidate_profile["skill_level"],
+            "target_role": candidate_profile.get("target_role"),
+            "profile_confidence": candidate_profile.get("profile_confidence"),
+        },
         "answers": [],
         "status": "in_progress",
         "started_at": now,
@@ -246,55 +424,83 @@ async def start_session(user_id: str, track_id: str, mode: str, db: AsyncIOMotor
     }
 
 
-async def score_voice_answer(question: dict, audio_base64: str, audio_format: str | None = None) -> dict:
-    """Send the audio inline to Gemini 1.5 Flash for a single transcribe+score
-    call. Retries once on any failure (parse or API error), then raises 503 —
-    mirroring assessment_service._call_gemini_json's retry-then-503 pattern."""
+async def score_voice_answer(
+    question: dict,
+    audio_base64: str,
+    audio_format: str | None = None,
+    duration_seconds: int | None = None,
+) -> dict:
+    """Send audio inline to the scoring engine for transcribe+score."""
     try:
         audio_bytes = base64.b64decode(audio_base64)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid audio data.") from exc
 
-    criteria = question.get("scoring_criteria", [])
     mime_type = _audio_mime_type(audio_format)
-    audio_part = genai.protos.Part(inline_data=genai.protos.Blob(mime_type=mime_type, data=audio_bytes))
-
-    async def _attempt(prompt_text: str) -> dict:
-        text_part = genai.protos.Part(text=prompt_text)
-        response = await model.generate_content_async([audio_part, text_part])
-        return _parse_json_response(response.text)
-
-    base_prompt = _build_voice_scoring_prompt(question, criteria)
-    try:
-        return await _attempt(base_prompt)
-    except Exception as first_error:
-        logger.warning("Gemini voice scoring failed, retrying once: %s", first_error)
-        try:
-            return await _attempt(base_prompt + _RETRY_SUFFIX)
-        except Exception as second_error:
-            logger.error("Gemini voice scoring failed after retry: %s", second_error)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI scoring service temporarily unavailable. Please try again.",
-            )
+    return await score_interview_audio(question, audio_bytes, mime_type, duration_seconds=duration_seconds)
 
 
 async def score_text_answer(question: dict, text_answer: str) -> dict:
-    """Score a typed technical answer in one Gemini call via generate_json,
-    with the same retry-then-503 behavior as score_voice_answer above."""
-    prompt = _build_text_scoring_prompt(question, text_answer)
+    """Score a typed technical answer through the calibrated scoring engine."""
+    return await score_interview_text(question, text_answer)
+
+
+async def score_text_answers_batch(questions: list[dict], answers_by_id: dict[str, str]) -> list[dict]:
+    """Score a full technical text section in one Gemini call."""
+    qa_items = [
+        {
+            "id": question["id"],
+            "topic_area": ", ".join(question.get("tags", [])[:2]) or question.get("phase", "technical"),
+            "difficulty": question.get("difficulty", "medium"),
+            "question": question.get("question_text", ""),
+            "model_answer": question.get("model_answer", ""),
+            "user_answer": answers_by_id.get(question["id"], ""),
+        }
+        for question in questions
+    ]
+
+    raw_result = await score_assessment_batch(qa_items)
+    evaluations_by_id = {evaluation["question_id"]: evaluation for evaluation in raw_result["evaluations"]}
+
+    scored: list[dict] = []
+    for question in questions:
+        evaluation = evaluations_by_id.get(question["id"], {})
+        score_0_to_10 = max(0, min(int(evaluation.get("score", 0)), 10))
+        scored.append(
+            {
+                "question_id": question["id"],
+                "overall_score": score_0_to_10 * 10,
+                "criteria_scores": evaluation.get("criteria_scores", {}),
+                "feedback": evaluation.get("feedback", ""),
+                "model_answer": question.get("model_answer", evaluation.get("model_answer", "")),
+                "transcription": None,
+                "confidence": evaluation.get("confidence"),
+                "strengths": evaluation.get("strengths", []),
+                "improvements": evaluation.get("improvements", []),
+                "review_flags": evaluation.get("review_flags", []),
+                "evidence": evaluation.get("evidence", []),
+                "score_rationale": evaluation.get("score_rationale"),
+                "rubric_version": raw_result.get("rubric_version", RUBRIC_VERSION),
+                "scoring_mode": raw_result.get("scoring_mode", "technical_text_batch"),
+                "scoring_metadata": evaluation.get("scoring_metadata") or {
+                    "rubric_version": raw_result.get("rubric_version", RUBRIC_VERSION),
+                    "scoring_mode": raw_result.get("scoring_mode", "technical_text_batch"),
+                    "provider": "gemini",
+                },
+            }
+        )
+    return scored
+
+
+async def score_image_answer(question: dict, image_base64: str, image_mime_type: str | None = None) -> dict:
+    """Use multimodal scoring to read and score a handwritten coding solution."""
     try:
-        return await generate_json(prompt)
-    except Exception as first_error:
-        logger.warning("Gemini text scoring failed, retrying once: %s", first_error)
-        try:
-            return await generate_json(prompt + _RETRY_SUFFIX)
-        except Exception as second_error:
-            logger.error("Gemini text scoring failed after retry: %s", second_error)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI scoring service temporarily unavailable. Please try again.",
-            )
+        image_bytes = base64.b64decode(image_base64)
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid image data.") from exc
+
+    mime_type = _image_mime_type(image_mime_type)
+    return await score_interview_image(question, image_bytes, mime_type)
 
 
 def _phase_weights(present_phases: list[str]) -> dict[str, float]:

@@ -5,9 +5,9 @@ import { Activity, CheckCircle2, Layers, Target, Users } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
 import StatCard from "@/components/ui/StatCard";
-import { TRACK_NAMES, TRACK_OPTIONS } from "@/lib/tracks";
 import { adminApi } from "@/lib/api";
 import { TRACK_COLORS } from "@/components/charts/chartTheme";
+import type { TrackSummary } from "@/types";
 
 // Phase 6 MODIFY: replaces the Phase-1 placeholder's hardcoded `STATS` array
 // with `adminApi.getStats()` (`GET /admin/stats`) — refetched every 60s per
@@ -23,8 +23,12 @@ export default function DashboardPage() {
     queryFn: adminApi.getStats,
     refetchInterval: REFRESH_INTERVAL_MS,
   });
+  const { data: tracks } = useQuery<TrackSummary[]>({
+    queryKey: ["admin-tracks"],
+    queryFn: adminApi.getTracks,
+  });
 
-  const distribution = TRACK_OPTIONS.map((track) => ({
+  const distribution = (tracks ?? []).map((track) => ({
     ...track,
     count: stats?.trackDistribution[track.id] ?? 0,
   }));
@@ -44,6 +48,29 @@ export default function DashboardPage() {
       <p className="mt-1 text-sm text-text-secondary">
         Live overview of V-Prep activity — candidates, mock interviews, and track engagement.
       </p>
+
+      <div className="mt-6 rounded-3xl bg-primary-500 p-8 text-white shadow-lift">
+        <p className="text-2xl font-bold text-primary-100">System Performance</p>
+        <p className="mt-2 text-sm font-medium text-primary-100/80">Weekly analytics overview</p>
+        <div className="mt-6 grid gap-8 sm:grid-cols-2">
+          <div>
+            <p className="text-5xl font-extrabold text-cranberry">
+              {stats ? `${stats.averageOverallScore}%` : "—"}
+            </p>
+            <p className="mt-2 text-xs font-bold uppercase tracking-wide text-primary-100">
+              Avg. Candidate Score
+            </p>
+          </div>
+          <div>
+            <p className="text-5xl font-extrabold text-primary-100">
+              {stats?.completedSessions ?? 0}
+            </p>
+            <p className="mt-2 text-xs font-bold uppercase tracking-wide text-primary-100">
+              Interviews Done
+            </p>
+          </div>
+        </div>
+      </div>
 
       <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard
@@ -106,10 +133,10 @@ export default function DashboardPage() {
                   key={track.id}
                   style={{
                     width: barsReady ? `${(track.count / totalEnrollments) * 100}%` : "0%",
-                    backgroundColor: TRACK_COLORS[track.id],
+                    backgroundColor: TRACK_COLORS[track.id] ?? track.color,
                     transition: "width 1s ease-out",
                   }}
-                  title={`${TRACK_NAMES[track.id]}: ${track.count}`}
+                  title={`${track.name}: ${track.count}`}
                 />
               ))}
           </div>
@@ -118,7 +145,7 @@ export default function DashboardPage() {
         <div className="mt-5 grid grid-cols-2 gap-x-6 gap-y-2.5 sm:grid-cols-3">
           {distribution.map((track) => (
             <div key={track.id} className="flex items-center gap-2">
-              <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: TRACK_COLORS[track.id] }} />
+              <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ backgroundColor: TRACK_COLORS[track.id] ?? track.color }} />
               <span className="truncate text-xs text-text-secondary">{track.name}</span>
               <span className="ml-auto text-xs font-semibold text-text-primary">{track.count}</span>
             </div>

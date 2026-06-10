@@ -7,7 +7,6 @@ import { useSession } from "next-auth/react";
 import { ChevronRight, Search } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
-import { TRACK_OPTIONS } from "@/lib/tracks";
 import DataTable, { type DataTableColumn } from "@/components/ui/DataTable";
 import RoleBadge from "@/components/ui/RoleBadge";
 import ScoreBadge from "@/components/ui/ScoreBadge";
@@ -70,6 +69,10 @@ export default function CandidatesPage() {
         role: roleFilter !== "all" ? roleFilter : undefined,
         trackId: trackFilter !== "all" ? trackFilter : undefined,
       }),
+  });
+  const { data: tracks } = useQuery({
+    queryKey: ["admin-tracks"],
+    queryFn: adminApi.getTracks,
   });
 
   const candidates = useMemo(() => data?.items ?? [], [data]);
@@ -216,7 +219,7 @@ export default function CandidatesPage() {
             className="rounded-xl border border-border bg-background-card px-3 py-2.5 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500"
           >
             <option value="all">All tracks</option>
-            {TRACK_OPTIONS.map((track) => (
+            {(tracks ?? []).map((track) => (
               <option key={track.id} value={track.id}>
                 {track.name}
               </option>

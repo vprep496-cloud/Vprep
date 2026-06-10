@@ -1,15 +1,67 @@
 "use client";
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useSession, signIn } from "next-auth/react";
+
+// ---------------------------------------------------------------------------
+// Demo account definitions — mirrors _DEMO_ACCOUNTS in backend/app/api/v1/auth.py
+// ---------------------------------------------------------------------------
+const DEMO_ACCOUNTS = [
+  {
+    key: "superadmin",
+    label: "Superadmin",
+    name: "Demo Superadmin",
+    email: "superadmin@demo.vprep",
+    badge: "SA",
+    badgeColor: "bg-purple-500",
+    description: "Full access · promote users · manage questions",
+  },
+  {
+    key: "admin",
+    label: "Admin",
+    name: "Demo Admin",
+    email: "admin@demo.vprep",
+    badge: "A",
+    badgeColor: "bg-sky-500",
+    description: "View candidates · analytics · read-only questions",
+  },
+  {
+    key: "candidate1",
+    label: "Candidate 1",
+    name: "Ahmad Raza",
+    email: "ahmad.raza@demo.vprep",
+    badge: "AR",
+    badgeColor: "bg-emerald-500",
+    description: "ML/AI track · intermediate · 3 sessions",
+  },
+  {
+    key: "candidate2",
+    label: "Candidate 2",
+    name: "Fatima Malik",
+    email: "fatima.malik@demo.vprep",
+    badge: "FM",
+    badgeColor: "bg-pink-500",
+    description: "Web Dev track · beginner · 2 sessions",
+  },
+  {
+    key: "candidate3",
+    label: "Candidate 3",
+    name: "Usman Khan",
+    email: "usman.khan@demo.vprep",
+    badge: "UK",
+    badgeColor: "bg-amber-500",
+    description: "DevOps track · advanced · 3 sessions",
+  },
+] as const;
 
 export default function LoginPage() {
   const router = useRouter();
   const { data: session, status } = useSession();
+  const [demoLoading, setDemoLoading] = useState<string | null>(null);
+  const [demoError, setDemoError] = useState<string | null>(null);
 
-  // Once NextAuth resolves an authenticated session, route by backend role:
-  // candidates aren't allowed in the admin portal, everyone else lands on /.
+  // Once NextAuth resolves an authenticated session, route by backend role.
   useEffect(() => {
     if (status !== "authenticated" || !session?.user) return;
 
@@ -20,15 +72,36 @@ export default function LoginPage() {
     }
   }, [status, session, router]);
 
+  const handleDemoLogin = async (accountKey: string) => {
+    setDemoError(null);
+    setDemoLoading(accountKey);
+    try {
+      const result = await signIn("demo", {
+        account_key: accountKey,
+        redirect: false,
+      });
+      if (result?.error) {
+        setDemoError("Demo login failed — is the backend running on :8000?");
+      }
+      // Navigation handled by the useEffect above once the session updates.
+    } catch {
+      setDemoError("Could not reach the backend. Make sure it's running.");
+    } finally {
+      setDemoLoading(null);
+    }
+  };
+
   return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-6">
-      <div className="w-full max-w-sm flex flex-col items-center text-center">
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 py-12">
+      <div className="w-full max-w-lg flex flex-col items-center text-center">
+        {/* Logo */}
         <div className="w-16 h-16 rounded-2xl bg-primary-500 flex items-center justify-center mb-5">
           <span className="text-white text-2xl font-bold">VP</span>
         </div>
         <h1 className="text-2xl font-bold text-text-primary">V-Prep</h1>
-        <p className="text-text-secondary text-sm mt-1 mb-10">Admin Portal</p>
+        <p className="text-text-secondary text-sm mt-1 mb-8">Admin Portal</p>
 
+        {/* Google sign-in */}
         <button
           type="button"
           onClick={() => signIn("google", { callbackUrl: "/" })}
@@ -39,8 +112,81 @@ export default function LoginPage() {
           Sign in with Google
         </button>
 
+        {/* Divider */}
+        <div className="w-full flex items-center gap-3 my-6">
+          <div className="flex-1 h-px bg-border" />
+          <span className="text-xs text-text-muted font-medium uppercase tracking-wide">
+            or use a demo account
+          </span>
+          <div className="flex-1 h-px bg-border" />
+        </div>
+
+        {/* Demo error */}
+        {demoError ? (
+          <div className="w-full mb-4 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-400 text-left">
+            {demoError}
+          </div>
+        ) : null}
+
+        {/* Demo account grid */}
+        <div className="w-full grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          {DEMO_ACCOUNTS.map((account) => {
+            const isLoading = demoLoading === account.key;
+            const isAnyLoading = demoLoading !== null;
+
+            return (
+              <button
+                key={account.key}
+                type="button"
+                onClick={() => handleDemoLogin(account.key)}
+                disabled={isAnyLoading}
+                className="flex items-start gap-3 rounded-xl border border-border bg-background-card p-3.5 text-left transition-colors hover:bg-background-surface hover:border-primary-500/40 disabled:opacity-60 disabled:cursor-not-allowed"
+              >
+                {/* Avatar */}
+                <div
+                  className={`flex-shrink-0 w-9 h-9 rounded-full ${account.badgeColor} flex items-center justify-center text-white text-xs font-bold`}
+                >
+                  {isLoading ? (
+                    <svg
+                      className="animate-spin w-4 h-4 text-white"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                    >
+                      <circle
+                        className="opacity-25"
+                        cx="12"
+                        cy="12"
+                        r="10"
+                        stroke="currentColor"
+                        strokeWidth="4"
+                      />
+                      <path
+                        className="opacity-75"
+                        fill="currentColor"
+                        d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                      />
+                    </svg>
+                  ) : (
+                    account.badge
+                  )}
+                </div>
+
+                {/* Text */}
+                <div className="min-w-0">
+                  <p className="text-sm font-semibold text-text-primary leading-tight">
+                    {account.name}
+                  </p>
+                  <p className="text-xs text-text-muted mt-0.5 leading-tight">
+                    {account.description}
+                  </p>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+
         <p className="text-text-muted text-xs mt-8">
-          Access is restricted to V-Prep admins and recruiters.
+          Demo accounts are for testing only and do not require a Google account.
         </p>
       </div>
     </main>

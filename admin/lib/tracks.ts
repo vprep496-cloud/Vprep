@@ -15,6 +15,7 @@ export interface TrackOption {
 }
 
 export const TRACK_OPTIONS: TrackOption[] = [
+  { id: "all", name: "Reusable HR/Behavioral" },
   { id: "ml_ai", name: "ML & AI" },
   { id: "web_dev", name: "Web Dev" },
   { id: "devops", name: "DevOps" },
@@ -33,13 +34,15 @@ export const TRACK_NAMES: Record<string, string> = Object.fromEntries(
 // as an independent field the backend would then reject on a mismatch.
 export const ANSWER_TYPE_BY_PHASE: Record<InterviewPhase, AnswerType> = {
   hr: "voice",
-  behavioral: "voice",
   technical: "text",
+  coding_logic: "image",
+  behavioral: "voice",
 };
 
 export const PHASE_OPTIONS: { value: InterviewPhase; label: string }[] = [
   { value: "hr", label: "HR" },
   { value: "technical", label: "Technical" },
+  { value: "coding_logic", label: "Coding Logic" },
   { value: "behavioral", label: "Behavioral" },
 ];
 

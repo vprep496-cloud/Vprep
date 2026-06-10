@@ -37,6 +37,7 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 HR_SCORING_CRITERIA = ["clarity", "relevance", "fluency", "confidence"]
 BEHAVIORAL_SCORING_CRITERIA = ["structure", "example_quality", "self_awareness", "impact"]
 TECHNICAL_SCORING_CRITERIA = ["accuracy", "depth", "practical_knowledge"]
+CODING_LOGIC_SCORING_CRITERIA = ["logic_correctness", "edge_cases", "complexity_awareness", "clarity"]
 
 HR_QUESTIONS = [
     "Tell me about yourself and what drives you toward this field.",
@@ -102,6 +103,33 @@ TECHNICAL_QUESTIONS_BY_TRACK: dict[str, list[str]] = {
         "How do you optimize the performance of a React Native app that feels slow?",
         "Explain how push notifications work end-to-end on mobile platforms.",
         "What is your approach to handling offline functionality in a mobile app?",
+    ],
+}
+
+CODING_LOGIC_QUESTIONS_BY_TRACK: dict[str, list[str]] = {
+    "ml_ai": [
+        "Handwrite pseudocode for finding the top-k most frequent labels in a dataset stream. Include the data structures you would use and the time complexity.",
+        "Handwrite the logic for splitting a dataset into train/validation/test sets while preserving class balance. Mention edge cases.",
+    ],
+    "web_dev": [
+        "Handwrite pseudocode for rate limiting login attempts per user and IP address. Include how expired attempts are cleaned up.",
+        "Handwrite the logic for merging paginated API results while avoiding duplicate records and preserving order.",
+    ],
+    "devops": [
+        "Handwrite a deployment rollback decision flow for a failed production release. Include health checks and traffic switching.",
+        "Handwrite pseudocode for detecting a service that is flapping based on recent health-check results.",
+    ],
+    "data_science": [
+        "Handwrite pseudocode to detect and cap outliers in a numeric column using the IQR method. Include how null values are handled.",
+        "Handwrite the logic for computing precision, recall, and F1 from a confusion matrix.",
+    ],
+    "cloud": [
+        "Handwrite a decision flow for routing requests across healthy instances in multiple availability zones.",
+        "Handwrite pseudocode for rotating an application secret without downtime.",
+    ],
+    "mobile_dev": [
+        "Handwrite pseudocode for an offline-first sync queue that retries failed API writes safely.",
+        "Handwrite the logic for debouncing a search input and cancelling stale requests in a mobile app.",
     ],
 }
 
@@ -171,6 +199,24 @@ def _build_documents() -> list[dict]:
                 "tags": ["technical", track_id],
             })
 
+    for track_id, questions in CODING_LOGIC_QUESTIONS_BY_TRACK.items():
+        for index, question_text in enumerate(questions):
+            documents.append({
+                "track_id": track_id,
+                "phase": "coding_logic",
+                "question_text": question_text,
+                "answer_type": "image",
+                "difficulty": _difficulty_for(index + 1),
+                "scoring_criteria": CODING_LOGIC_SCORING_CRITERIA,
+                "model_answer": (
+                    "A strong handwritten solution should present clear algorithmic "
+                    "steps or pseudocode, use appropriate data structures, address "
+                    "important edge cases, and explain time/space complexity where "
+                    "relevant. The exact syntax is less important than correct logic."
+                ),
+                "tags": ["coding_logic", track_id, "handwritten"],
+            })
+
     return documents
 
 
@@ -183,11 +229,23 @@ def main() -> None:
         db = client[db_name]
         collection = db["questions"]
 
+        documents = _build_documents()
         if collection.estimated_document_count() > 0:
-            print("Questions already seeded")
+            existing_keys = {
+                (doc.get("track_id"), doc.get("phase"), doc.get("question_text"))
+                for doc in collection.find({}, {"track_id": 1, "phase": 1, "question_text": 1})
+            }
+            missing_documents = [
+                doc for doc in documents
+                if (doc["track_id"], doc["phase"], doc["question_text"]) not in existing_keys
+            ]
+            if not missing_documents:
+                print("Questions already seeded")
+                return
+            collection.insert_many(missing_documents)
+            print(f"Added {len(missing_documents)} missing questions into '{db_name}.questions'.")
             return
 
-        documents = _build_documents()
         collection.insert_many(documents)
         print(f"Seeded {len(documents)} questions into '{db_name}.questions'.")
     finally:

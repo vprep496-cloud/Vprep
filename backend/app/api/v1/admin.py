@@ -12,26 +12,29 @@
 # `$facet`) runs as a MongoDB pipeline — nothing is loaded in bulk and reduced
 # in Python.
 import math
+import re
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 
-from app.api.v1.tracks import TRACKS_BY_ID
+from app.api.v1.tracks import get_track_catalog, get_track_or_none, get_tracks_by_id
 from app.core.database import get_db
 from app.core.dependencies import require_role
+from app.services import admin_ai_service
+from app.services.gemini import get_ai_status, live_health_check
 from app.services.interview_service import to_session_result
 
 router = APIRouter()
 
-_VALID_PHASES = {"hr", "technical", "behavioral"}
+_VALID_PHASES = {"hr", "technical", "coding_logic", "behavioral"}
 # Phase -> the only `answer_type` the spec allows for it (POST/PUT validation).
-_ANSWER_TYPE_BY_PHASE = {"hr": "voice", "behavioral": "voice", "technical": "text"}
-_TRACK_IDS = list(TRACKS_BY_ID.keys())
+_ANSWER_TYPE_BY_PHASE = {"hr": "voice", "behavioral": "voice", "technical": "text", "coding_logic": "image"}
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +71,42 @@ class QuestionUpdate(BaseModel):
     tags: list[str] | None = None
 
 
+class QuestionGenerate(BaseModel):
+    track_id: str
+    phase: str
+    count: int = Field(default=5, ge=1, le=20)
+    difficulty: Literal["easy", "medium", "hard"] | None = None
+    guidance: str | None = None
+
+
+class TrackCreate(BaseModel):
+    id: str | None = None
+    name: str
+    description: str
+    icon: str = "briefcase-outline"
+    color: str = "#818CF8"
+    total_days: int = Field(default=30, ge=1, le=180)
+    topic_areas: list[str] = Field(default_factory=list)
+
+
+class TrackUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    icon: str | None = None
+    color: str | None = None
+    total_days: int | None = Field(default=None, ge=1, le=180)
+    topic_areas: list[str] | None = None
+    is_active: bool | None = None
+
+
+class ManualReviewUpdate(BaseModel):
+    score: int | None = Field(default=None, ge=0, le=100)
+    criteria_scores: dict[str, int] | None = None
+    feedback: str | None = None
+    reviewer_notes: str | None = None
+    status: Literal["pending", "reviewed", "not_required"] = "reviewed"
+
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -89,14 +128,20 @@ def _serialize(doc: dict) -> dict:
     return serialized
 
 
+def _serialize_track_like(doc: dict) -> dict:
+    serialized = dict(doc)
+    serialized.pop("_id", None)
+    serialized.setdefault("topic_areas", [])
+    serialized.setdefault("is_active", True)
+    return serialized
+
+
 def _validate_question_fields(phase: str | None, answer_type: str | None) -> None:
-    """Shared POST/PUT validation: `phase` must be one of the three known
-    phases, and `answer_type` (when both are known) must match the phase's
-    fixed answer modality — voice for HR/Behavioral, text for Technical."""
+    """Shared POST/PUT validation: phase and answer modality must agree."""
     if phase is not None and phase not in _VALID_PHASES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="phase must be one of: hr, technical, behavioral.",
+            detail="phase must be one of: hr, technical, coding_logic, behavioral.",
         )
     if phase is not None and answer_type is not None:
         expected = _ANSWER_TYPE_BY_PHASE[phase]
@@ -105,6 +150,68 @@ def _validate_question_fields(phase: str | None, answer_type: str | None) -> Non
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"answer_type for '{phase}' questions must be '{expected}'.",
             )
+
+
+def _slugify_track_id(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+    if not slug:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Track id cannot be empty.")
+    return slug[:48]
+
+
+async def _validate_track_id(track_id: str, db: AsyncIOMotorDatabase, *, allow_all: bool = False) -> None:
+    if allow_all and track_id == "all":
+        return
+    if await get_track_or_none(track_id, db) is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
+
+
+def _phase_weights(present_phases: list[str]) -> dict[str, float]:
+    base = {"hr": 0.30, "technical": 0.35, "coding_logic": 0.15, "behavioral": 0.20}
+    missing_weight = sum(weight for phase, weight in base.items() if phase not in present_phases)
+    bonus = missing_weight / len(present_phases) if present_phases else 0.0
+    return {phase: base[phase] + bonus for phase in present_phases}
+
+
+def _recompute_session_scoring(session: dict) -> tuple[list[dict], int]:
+    phase_results: list[dict] = []
+    phase_scores: dict[str, int] = {}
+
+    for phase in session.get("phases", []):
+        answers = [
+            answer
+            for answer in session.get("answers", [])
+            if answer.get("phase") == phase
+        ]
+        if not answers:
+            continue
+        phase_score = round(sum(answer["score"] for answer in answers) / len(answers))
+        phase_scores[phase] = phase_score
+        phase_results.append({
+            "phase": phase,
+            "score": phase_score,
+            "question_count": len(answers),
+            "answers": answers,
+        })
+
+    weights = _phase_weights(list(phase_scores.keys()))
+    overall_score = round(sum(phase_scores[phase] * weights[phase] for phase in phase_scores))
+    return phase_results, max(0, min(overall_score, 100))
+
+
+# ---------------------------------------------------------------------------
+# GET /ai/status — safe AI provider configuration + optional live check
+# ---------------------------------------------------------------------------
+
+
+@router.get("/ai/status")
+async def get_ai_provider_status(
+    live_check: bool = Query(False),
+    _current_user: dict = Depends(require_role("admin", "superadmin")),
+):
+    if live_check:
+        return await live_health_check()
+    return get_ai_status()
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +228,7 @@ async def get_stats(
     visited exactly once via `$facet`, computing every metric that collection
     owns in one pipeline pass — `$count`/`$avg`/`$group` throughout, never a
     bulk load-and-reduce in Python (Agent Rule #4)."""
+    tracks = await get_track_catalog(db)
 
     users_facets = await db["users"].aggregate([
         {"$facet": {
@@ -155,8 +263,8 @@ async def get_stats(
     average_overall_score = round(avg_bucket[0]["avg"], 1) if avg_bucket and avg_bucket[0]["avg"] is not None else 0.0
 
     # Seed every known track with 0 so the dashboard's distribution bar always
-    # renders all six tracks, not just the ones with at least one enrollment.
-    track_distribution: dict[str, int] = {track_id: 0 for track_id in _TRACK_IDS}
+    # renders the whole active catalog, not just tracks with enrollments.
+    track_distribution: dict[str, int] = {track["id"]: 0 for track in tracks}
     for bucket in (enrollments_facets[0]["by_track"] if enrollments_facets else []):
         if bucket["_id"] in track_distribution:
             track_distribution[bucket["_id"]] = bucket["n"]
@@ -255,6 +363,7 @@ async def get_candidate(
     user = await db["users"].find_one({"_id": object_id})
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Candidate not found.")
+    tracks_by_id = await get_tracks_by_id(db)
 
     # --- Enrollments, enriched with the static track catalog entry (mirrors
     # enrollment_service.get_all_enrollments's `_attach_track_data` shape, but
@@ -264,7 +373,7 @@ async def get_candidate(
     enrollments: list[dict] = []
     async for enrollment in db["enrollments"].find({"user_id": candidate_id}).sort("updated_at", -1):
         enriched = _serialize(enrollment)
-        enriched["track"] = TRACKS_BY_ID.get(enriched["track_id"])
+        enriched["track"] = tracks_by_id.get(enriched["track_id"])
         plan = await db["plans"].find_one({"user_id": candidate_id, "track_id": enriched["track_id"]}, {"_id": 1})
         enriched["plan_exists"] = plan is not None
         enrollments.append(enriched)
@@ -337,6 +446,91 @@ async def get_candidate(
 
 
 # ---------------------------------------------------------------------------
+# Tracks — runtime catalog management (superadmin mutations)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/tracks")
+async def list_admin_tracks(
+    _current_user: dict = Depends(require_role("admin", "superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    return {"tracks": await get_track_catalog(db)}
+
+
+@router.post("/tracks", status_code=status.HTTP_201_CREATED)
+async def create_track(
+    payload: TrackCreate,
+    _current_user: dict = Depends(require_role("superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    track_id = _slugify_track_id(payload.id or payload.name)
+    existing = await get_track_or_none(track_id, db)
+    existing_document = await db["tracks"].find_one({"id": track_id}, {"_id": 1})
+    if existing is not None or existing_document is not None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Track id already exists.")
+
+    now = datetime.now(timezone.utc)
+    document = {
+        **payload.model_dump(exclude={"id"}),
+        "id": track_id,
+        "topic_areas": [topic.strip() for topic in payload.topic_areas if topic.strip()],
+        "is_active": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    await db["tracks"].insert_one(dict(document))
+    return {key: value for key, value in document.items() if key != "_id"}
+
+
+@router.put("/tracks/{track_id}")
+async def update_track(
+    track_id: str,
+    payload: TrackUpdate,
+    _current_user: dict = Depends(require_role("superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    existing = await get_track_or_none(track_id, db)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+
+    updates = payload.model_dump(exclude_none=True)
+    if "topic_areas" in updates:
+        updates["topic_areas"] = [topic.strip() for topic in updates["topic_areas"] if topic.strip()]
+    if not updates:
+        return existing
+
+    now = datetime.now(timezone.utc)
+    document = {
+        **existing,
+        **updates,
+        "id": track_id,
+        "is_active": updates.get("is_active", existing.get("is_active", True)),
+        "created_at": existing.get("created_at", now),
+        "updated_at": now,
+    }
+    await db["tracks"].replace_one({"id": track_id}, document, upsert=True)
+    updated = await db["tracks"].find_one({"id": track_id})
+    return _serialize_track_like(updated)
+
+
+@router.delete("/tracks/{track_id}")
+async def deactivate_track(
+    track_id: str,
+    _current_user: dict = Depends(require_role("superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    existing = await get_track_or_none(track_id, db)
+    if existing is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+
+    now = datetime.now(timezone.utc)
+    document = {**existing, "id": track_id, "is_active": False, "created_at": existing.get("created_at", now), "updated_at": now}
+    await db["tracks"].replace_one({"id": track_id}, document, upsert=True)
+    return {"message": "Track deactivated"}
+
+
+# ---------------------------------------------------------------------------
 # Question bank — GET (list), POST/PUT/DELETE (superadmin only)
 # ---------------------------------------------------------------------------
 
@@ -381,12 +575,41 @@ async def create_question(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     _validate_question_fields(payload.phase, payload.answer_type)
+    await _validate_track_id(payload.track_id, db, allow_all=payload.phase in {"hr", "behavioral"})
 
     now = datetime.now(timezone.utc)
     document = {**payload.model_dump(), "created_at": now, "updated_at": now}
     result = await db["questions"].insert_one(dict(document))
     document["id"] = str(result.inserted_id)
     return document
+
+
+@router.post("/questions/generate", status_code=status.HTTP_201_CREATED)
+async def generate_questions_with_ai(
+    payload: QuestionGenerate,
+    _current_user: dict = Depends(require_role("superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    _validate_question_fields(payload.phase, _ANSWER_TYPE_BY_PHASE.get(payload.phase))
+    track = await get_track_or_none(payload.track_id, db)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
+
+    documents = await admin_ai_service.generate_question_documents(
+        track,
+        payload.phase,
+        payload.count,
+        payload.difficulty,
+        payload.guidance,
+    )
+    now = datetime.now(timezone.utc)
+    documents = [{**document, "created_at": now, "updated_at": now} for document in documents]
+    result = await db["questions"].insert_many(documents)
+
+    created = []
+    for document, inserted_id in zip(documents, result.inserted_ids):
+        created.append({**document, "id": str(inserted_id)})
+    return {"questions": created, "total": len(created)}
 
 
 @router.put("/questions/{question_id}")
@@ -408,7 +631,9 @@ async def update_question(
     # against whichever value (new or pre-existing) will end up persisted.
     resulting_phase = updates.get("phase", existing.get("phase"))
     resulting_answer_type = updates.get("answer_type", existing.get("answer_type"))
+    resulting_track_id = updates.get("track_id", existing.get("track_id"))
     _validate_question_fields(resulting_phase, resulting_answer_type)
+    await _validate_track_id(resulting_track_id, db, allow_all=resulting_phase in {"hr", "behavioral"})
 
     if not updates:
         return _serialize(existing)
@@ -464,6 +689,7 @@ async def get_analytics(
 ):
     since = datetime.now(timezone.utc) - timedelta(days=days)
     track_match: dict = {"track_id": track_id} if track_id else {}
+    tracks_by_id = await get_tracks_by_id(db)
 
     # --- score_trend: daily average score + session count for completed
     # sessions, grouped by `completed_at` truncated to a day string. ---
@@ -496,7 +722,7 @@ async def get_analytics(
     track_distribution = [
         {
             "track_id": bucket["_id"],
-            "track_name": TRACKS_BY_ID[bucket["_id"]]["name"] if bucket["_id"] in TRACKS_BY_ID else bucket["_id"],
+            "track_name": tracks_by_id[bucket["_id"]]["name"] if bucket["_id"] in tracks_by_id else bucket["_id"],
             "count": bucket["count"],
         }
         for bucket in distribution_raw
@@ -578,3 +804,75 @@ async def get_session_for_review(
 
     session["id"] = str(session.pop("_id"))
     return to_session_result(session)
+
+
+@router.put("/sessions/{session_id}/answers/{question_id}/review")
+async def review_session_answer(
+    session_id: str,
+    question_id: str,
+    payload: ManualReviewUpdate,
+    current_user: dict = Depends(require_role("admin", "superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    object_id = _object_id_or_404(session_id, "Interview session not found.")
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+    if session.get("status") != "completed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only completed sessions can be manually reviewed.",
+        )
+
+    reviewed_at = datetime.now(timezone.utc)
+    answers: list[dict] = []
+    found = False
+    for answer in session.get("answers", []):
+        if answer.get("question_id") != question_id:
+            answers.append(answer)
+            continue
+
+        found = True
+        updated = dict(answer)
+        updated.setdefault("ai_score", answer.get("score"))
+        updated.setdefault("ai_criteria_scores", answer.get("criteria_scores", {}))
+        updated.setdefault("ai_feedback", answer.get("feedback", ""))
+
+        if payload.score is not None:
+            updated["score"] = payload.score
+        if payload.criteria_scores is not None:
+            updated["criteria_scores"] = {
+                criterion: max(0, min(int(value), 10))
+                for criterion, value in payload.criteria_scores.items()
+            }
+        if payload.feedback is not None:
+            updated["feedback"] = payload.feedback
+
+        updated["manual_review_status"] = payload.status
+        updated["reviewer_notes"] = payload.reviewer_notes
+        updated["reviewed_by"] = current_user["id"]
+        updated["reviewed_at"] = reviewed_at
+        answers.append(updated)
+
+    if not found:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer not found in this session.")
+
+    updated_session = {**session, "answers": answers}
+    phase_results, overall_score = _recompute_session_scoring(updated_session)
+    await db["sessions"].update_one(
+        {"_id": object_id},
+        {
+            "$set": {
+                "answers": answers,
+                "phase_results": phase_results,
+                "overall_score": overall_score,
+                "last_reviewed_at": reviewed_at,
+            }
+        },
+    )
+
+    updated_session["phase_results"] = phase_results
+    updated_session["overall_score"] = overall_score
+    updated_session["last_reviewed_at"] = reviewed_at
+    updated_session["id"] = str(updated_session.pop("_id"))
+    return to_session_result(updated_session)

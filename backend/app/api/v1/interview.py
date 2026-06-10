@@ -3,16 +3,13 @@ from bson.errors import InvalidId
 from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.api.v1.tracks import TRACKS_BY_ID
+from app.api.v1.tracks import get_track_or_none
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.models.session import AnswerSubmission, SessionComplete, SessionCreate
+from app.models.session import AnswerSubmission, BatchTextAnswerSubmission, SessionComplete, SessionCreate
 from app.services import interview_service
 
 router = APIRouter()
-
-_VALID_TRACK_IDS = set(TRACKS_BY_ID.keys())
-
 
 def _object_id_or_404(session_id: str) -> ObjectId:
     try:
@@ -42,7 +39,7 @@ async def start_interview(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Start a new mock interview session. Requires an active enrollment in the track."""
-    if payload.track_id not in _VALID_TRACK_IDS:
+    if await get_track_or_none(payload.track_id, db) is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
 
     enrollment = await db["enrollments"].find_one(
@@ -77,6 +74,11 @@ async def submit_answer(
     question = next((q for q in phase_questions if q["id"] == payload.question_id), None)
     if question is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in this session.")
+    if payload.answer_type != question.get("answer_type"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"This question requires a {question.get('answer_type')} answer.",
+        )
 
     already_answered = any(
         answer["question_id"] == payload.question_id for answer in session.get("answers", [])
@@ -90,15 +92,45 @@ async def submit_answer(
     if payload.answer_type == "voice":
         if not payload.audio_base64:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="audio_base64 is required for voice answers.")
-        scored = await interview_service.score_voice_answer(question, payload.audio_base64)
+        scored = await interview_service.score_voice_answer(
+            question,
+            payload.audio_base64,
+            payload.audio_format,
+            payload.answer_duration_seconds,
+        )
         transcription = scored.get("transcription")
         user_text_answer = None
-    else:
+    elif payload.answer_type == "text":
         if not payload.text_answer:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="text_answer is required for text answers.")
         scored = await interview_service.score_text_answer(question, payload.text_answer)
         transcription = None
         user_text_answer = payload.text_answer
+    else:
+        if not payload.image_base64:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="image_base64 is required for image answers.")
+        scored = await interview_service.score_image_answer(
+            question,
+            payload.image_base64,
+            payload.image_mime_type,
+        )
+        transcription = scored.get("transcription")
+        user_text_answer = None
+
+    review_flags = list(scored.get("review_flags", []))
+    if payload.answer_type == "image":
+        if payload.image_width and payload.image_height and max(payload.image_width, payload.image_height) < 700:
+            review_flags.extend(["low_resolution_image", "manual_review_recommended"])
+        if payload.image_size_bytes and payload.image_size_bytes > 8 * 1024 * 1024:
+            review_flags.extend(["large_image_upload", "manual_review_recommended"])
+        review_flags = sorted(set(review_flags))
+    scoring_metadata = dict(scored.get("scoring_metadata") or {})
+    scoring_metadata["review_flags"] = review_flags
+    manual_review_status = (
+        "pending"
+        if payload.phase in {"behavioral", "coding_logic"} or "manual_review_recommended" in review_flags
+        else "not_required"
+    )
 
     answer_doc = {
         "question_id": payload.question_id,
@@ -107,6 +139,10 @@ async def submit_answer(
         "answer_type": payload.answer_type,
         "transcription": transcription,
         "user_text_answer": user_text_answer,
+        "answer_duration_seconds": payload.answer_duration_seconds,
+        "image_width": payload.image_width,
+        "image_height": payload.image_height,
+        "image_size_bytes": payload.image_size_bytes,
         "score": max(0, min(int(scored.get("overall_score", 0)), 100)),
         "criteria_scores": scored.get("criteria_scores", {}),
         "feedback": scored.get("feedback", ""),
@@ -114,6 +150,25 @@ async def submit_answer(
         # one — it's the same text either way (we feed it to Gemini as the
         # rubric and ask it to echo it back, mirroring assessment_service).
         "model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+        "confidence": scored.get("confidence"),
+        "strengths": scored.get("strengths", []),
+        "improvements": scored.get("improvements", []),
+        "review_flags": review_flags,
+        "evidence": scored.get("evidence", []),
+        "score_rationale": scored.get("score_rationale"),
+        "rubric_version": scored.get("rubric_version"),
+        "scoring_mode": scored.get("scoring_mode"),
+        "scoring_metadata": scoring_metadata,
+        "ai_score": max(0, min(int(scored.get("overall_score", 0)), 100)),
+        "ai_criteria_scores": scored.get("criteria_scores", {}),
+        "ai_feedback": scored.get("feedback", ""),
+        "ai_confidence": scored.get("confidence"),
+        "ai_review_flags": review_flags,
+        "ai_scoring_metadata": scoring_metadata,
+        "manual_review_status": manual_review_status,
+        "reviewer_notes": None,
+        "reviewed_by": None,
+        "reviewed_at": None,
     }
 
     await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": answer_doc}})
@@ -125,7 +180,129 @@ async def submit_answer(
         "feedback": answer_doc["feedback"],
         "model_answer": answer_doc["model_answer"],
         "transcription": answer_doc["transcription"],
+        "confidence": answer_doc["confidence"],
+        "strengths": answer_doc["strengths"],
+        "improvements": answer_doc["improvements"],
+        "review_flags": answer_doc["review_flags"],
+        "evidence": answer_doc["evidence"],
+        "score_rationale": answer_doc["score_rationale"],
+        "rubric_version": answer_doc["rubric_version"],
+        "scoring_mode": answer_doc["scoring_mode"],
     }
+
+
+@router.post("/answer-batch")
+async def submit_text_answer_batch(
+    payload: BatchTextAnswerSubmission,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Score a whole technical text section in one Gemini call."""
+    object_id = _object_id_or_404(payload.session_id)
+    session = await _get_owned_session(payload.session_id, current_user["id"], db)
+
+    if session["status"] != "in_progress":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This interview session has already been completed.",
+        )
+
+    phase_questions = session.get("questions_by_phase", {}).get(payload.phase, [])
+    questions_by_id = {question["id"]: question for question in phase_questions}
+    requested_ids = [answer.question_id for answer in payload.answers]
+
+    if len(set(requested_ids)) != len(requested_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Duplicate answers in batch.")
+    if not requested_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No answers submitted.")
+
+    existing_answer_ids = {answer["question_id"] for answer in session.get("answers", [])}
+    invalid_ids = [question_id for question_id in requested_ids if question_id not in questions_by_id]
+    already_answered = [question_id for question_id in requested_ids if question_id in existing_answer_ids]
+    non_text_ids = [
+        question_id
+        for question_id in requested_ids
+        if questions_by_id.get(question_id, {}).get("answer_type") != "text"
+    ]
+    empty_ids = [answer.question_id for answer in payload.answers if len(answer.text_answer.strip()) < 20]
+
+    if invalid_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in this session.")
+    if already_answered:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="One or more answers were already submitted.")
+    if non_text_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch scoring only supports text answers.")
+    if empty_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Every technical answer must be at least 20 characters.")
+
+    answers_by_id = {answer.question_id: answer.text_answer.strip() for answer in payload.answers}
+    questions = [questions_by_id[question_id] for question_id in requested_ids]
+    scored_batch = await interview_service.score_text_answers_batch(questions, answers_by_id)
+
+    answer_docs = []
+    responses = []
+    for question, scored in zip(questions, scored_batch):
+        review_flags = sorted(set(scored.get("review_flags", [])))
+        scoring_metadata = dict(scored.get("scoring_metadata") or {})
+        scoring_metadata["review_flags"] = review_flags
+        score = max(0, min(int(scored.get("overall_score", 0)), 100))
+        answer_doc = {
+            "question_id": question["id"],
+            "question_text": question["question_text"],
+            "phase": payload.phase,
+            "answer_type": "text",
+            "transcription": None,
+            "user_text_answer": answers_by_id[question["id"]],
+            "answer_duration_seconds": None,
+            "image_width": None,
+            "image_height": None,
+            "image_size_bytes": None,
+            "score": score,
+            "criteria_scores": scored.get("criteria_scores", {}),
+            "feedback": scored.get("feedback", ""),
+            "model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+            "confidence": scored.get("confidence"),
+            "strengths": scored.get("strengths", []),
+            "improvements": scored.get("improvements", []),
+            "review_flags": review_flags,
+            "evidence": scored.get("evidence", []),
+            "score_rationale": scored.get("score_rationale"),
+            "rubric_version": scored.get("rubric_version"),
+            "scoring_mode": scored.get("scoring_mode"),
+            "scoring_metadata": scoring_metadata,
+            "ai_score": score,
+            "ai_criteria_scores": scored.get("criteria_scores", {}),
+            "ai_feedback": scored.get("feedback", ""),
+            "ai_confidence": scored.get("confidence"),
+            "ai_review_flags": review_flags,
+            "ai_scoring_metadata": scoring_metadata,
+            "manual_review_status": "not_required",
+            "reviewer_notes": None,
+            "reviewed_by": None,
+            "reviewed_at": None,
+        }
+        answer_docs.append(answer_doc)
+        responses.append(
+            {
+                "question_id": answer_doc["question_id"],
+                "score": answer_doc["score"],
+                "criteria_scores": answer_doc["criteria_scores"],
+                "feedback": answer_doc["feedback"],
+                "model_answer": answer_doc["model_answer"],
+                "transcription": answer_doc["transcription"],
+                "confidence": answer_doc["confidence"],
+                "strengths": answer_doc["strengths"],
+                "improvements": answer_doc["improvements"],
+                "review_flags": answer_doc["review_flags"],
+                "evidence": answer_doc["evidence"],
+                "score_rationale": answer_doc["score_rationale"],
+                "rubric_version": answer_doc["rubric_version"],
+                "scoring_mode": answer_doc["scoring_mode"],
+            }
+        )
+
+    await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": {"$each": answer_docs}}})
+    return {"answers": responses}
 
 
 @router.post("/complete")
@@ -179,7 +356,7 @@ async def get_history(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Every completed session for the current user, optionally filtered by track."""
-    if track_id is not None and track_id not in _VALID_TRACK_IDS:
+    if track_id is not None and await get_track_or_none(track_id, db) is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
 
     sessions = await interview_service.get_session_history(current_user["id"], track_id, db)

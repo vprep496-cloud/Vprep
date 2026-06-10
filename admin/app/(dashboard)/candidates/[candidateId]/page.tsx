@@ -1,15 +1,17 @@
 "use client";
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeft,
   Award,
   CalendarDays,
+  FileImage,
   Loader2,
   Mic,
+  Save,
   Sparkles,
   Target,
   X,
@@ -28,12 +30,13 @@ type DetailTab = "enrollments" | "sessions" | "assessments";
 const PHASE_LABELS: Record<string, string> = {
   hr: "HR Round",
   technical: "Technical Round",
+  coding_logic: "Coding Logic",
   behavioral: "Behavioral Round",
 };
 
 const MODE_LABELS: Record<string, string> = {
   hr: "HR Only",
-  technical: "Technical Only",
+  technical: "Technical + Coding",
   behavioral: "Behavioral Only",
   full_mock: "Full Mock",
 };
@@ -72,7 +75,47 @@ function SummaryTile({ icon: Icon, label, value }: SummaryTileProps) {
 // collapsing keeps a long list scannable), an admin reviewing a session wants
 // every transcription/score/feedback/model-answer visible at once (spec:
 // "Admins can review any session including voice transcriptions").
-function ReviewAnswerCard({ answer, index }: { answer: InterviewQuestionAnswer; index: number }) {
+function ReviewAnswerCard({
+  sessionId,
+  answer,
+  index,
+  onReviewed,
+}: {
+  sessionId: string;
+  answer: InterviewQuestionAnswer;
+  index: number;
+  onReviewed: () => void;
+}) {
+  const [score, setScore] = useState(String(answer.score));
+  const [feedback, setFeedback] = useState(answer.feedback);
+  const [notes, setNotes] = useState(answer.reviewerNotes ?? "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const answerLabel =
+    answer.answerType === "voice"
+      ? "Voice transcription"
+      : answer.answerType === "image"
+        ? "Handwritten solution"
+        : "Typed answer";
+
+  const handleSaveReview = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await adminApi.reviewAnswer(sessionId, answer.questionId, {
+        score: Math.max(0, Math.min(Number(score), 100)),
+        feedback,
+        reviewerNotes: notes,
+        status: "reviewed",
+      });
+      onReviewed();
+    } catch {
+      setError("Could not save manual review.");
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div className="rounded-xl border border-border bg-background-surface p-4">
       <div className="flex items-start justify-between gap-3">
@@ -85,14 +128,38 @@ function ReviewAnswerCard({ answer, index }: { answer: InterviewQuestionAnswer; 
 
       <div className="mt-3 flex items-center gap-1.5 text-xs font-medium text-text-muted">
         {answer.answerType === "voice" ? <Mic size={13} /> : null}
-        <span>{answer.answerType === "voice" ? "Voice transcription" : "Typed answer"}</span>
+        {answer.answerType === "image" ? <FileImage size={13} /> : null}
+        <span>{answerLabel}</span>
+        {answer.answerDurationSeconds ? <span>· {answer.answerDurationSeconds}s</span> : null}
       </div>
       <p className="mt-1 whitespace-pre-wrap text-sm leading-6 text-text-secondary">
-        {answer.answerType === "voice" ? answer.transcription ?? "—" : answer.userTextAnswer ?? "—"}
+        {answer.answerType === "voice" || answer.answerType === "image"
+          ? answer.transcription ?? "—"
+          : answer.userTextAnswer ?? "—"}
       </p>
 
       <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-text-muted">Feedback</p>
       <p className="mt-1 text-sm leading-6 text-text-secondary">{answer.feedback}</p>
+
+      {answer.scoreRationale ? (
+        <>
+          <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-text-muted">Score Rationale</p>
+          <p className="mt-1 text-sm leading-6 text-text-secondary">{answer.scoreRationale}</p>
+        </>
+      ) : null}
+
+      {(answer.evidence?.length ?? 0) > 0 ? (
+        <div className="mt-3 rounded-xl border border-border bg-background-card p-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Evidence</p>
+          <ul className="mt-2 space-y-1.5">
+            {(answer.evidence ?? []).map((item, evidenceIndex) => (
+              <li key={evidenceIndex} className="text-sm leading-5 text-text-secondary">
+                {item}
+              </li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
 
       <p className="mt-3 text-xs font-semibold uppercase tracking-wide text-text-muted">Model Answer</p>
       <p className="mt-1 text-sm leading-6 text-text-secondary">{answer.modelAnswer}</p>
@@ -106,12 +173,76 @@ function ReviewAnswerCard({ answer, index }: { answer: InterviewQuestionAnswer; 
           ))}
         </div>
       ) : null}
+
+      {((answer.confidence !== null && answer.confidence !== undefined) ||
+        (answer.reviewFlags?.length ?? 0) > 0 ||
+        answer.rubricVersion) ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {answer.confidence !== null && answer.confidence !== undefined ? (
+            <span className="rounded-full bg-background-card px-2.5 py-1 text-xs text-text-muted">
+              confidence: <span className="font-semibold text-text-secondary">{Math.round(answer.confidence * 100)}%</span>
+            </span>
+          ) : null}
+          {answer.rubricVersion ? (
+            <span className="rounded-full bg-background-card px-2.5 py-1 text-xs text-text-muted">
+              {answer.rubricVersion}
+            </span>
+          ) : null}
+          {(answer.reviewFlags ?? []).map((flag) => (
+            <span key={flag} className="rounded-full bg-warning/15 px-2.5 py-1 text-xs font-medium text-warning">
+              {flag.replace(/_/g, " ")}
+            </span>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="mt-4 rounded-xl border border-border bg-background-card p-3.5">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs font-semibold uppercase tracking-wide text-text-muted">Manual Review</p>
+          <span className="text-xs text-text-muted">
+            AI score: <span className="font-semibold text-text-secondary">{answer.aiScore ?? answer.score}/100</span>
+          </span>
+        </div>
+        <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-[110px_1fr]">
+          <input
+            type="number"
+            min={0}
+            max={100}
+            value={score}
+            onChange={(event) => setScore(event.target.value)}
+            className="rounded-lg border border-border bg-background-surface px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500"
+          />
+          <input
+            value={notes}
+            onChange={(event) => setNotes(event.target.value)}
+            placeholder="Reviewer notes"
+            className="rounded-lg border border-border bg-background-surface px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary-500"
+          />
+        </div>
+        <textarea
+          value={feedback}
+          onChange={(event) => setFeedback(event.target.value)}
+          rows={2}
+          className="mt-3 w-full resize-none rounded-lg border border-border bg-background-surface px-3 py-2 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500"
+        />
+        {error ? <p className="mt-2 text-xs text-danger">{error}</p> : null}
+        <button
+          type="button"
+          onClick={handleSaveReview}
+          disabled={saving}
+          className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-primary-500 px-3 py-1.5 text-xs font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
+        >
+          {saving ? <Loader2 size={13} className="animate-spin" /> : <Save size={13} />}
+          Save Review
+        </button>
+      </div>
     </div>
   );
 }
 
 function SessionReviewModal({ sessionId, onClose }: { sessionId: string; onClose: () => void }) {
-  const { data: session, isLoading, isError } = useQuery({
+  const queryClient = useQueryClient();
+  const { data: session, isLoading, isError, refetch } = useQuery({
     queryKey: ["admin-session-review", sessionId],
     queryFn: () => adminApi.getSession(sessionId),
     // `GET /admin/sessions/{id}` is the spec's dedicated full-review endpoint
@@ -122,6 +253,21 @@ function SessionReviewModal({ sessionId, onClose }: { sessionId: string; onClose
     // route caps its embedded list at 20) and exercises the endpoint the
     // spec calls out by name for admin session review.
   });
+  const { data: tracks } = useQuery({
+    queryKey: ["admin-tracks"],
+    queryFn: adminApi.getTracks,
+  });
+  const trackNames = useMemo(
+    () => ({
+      ...TRACK_NAMES,
+      ...Object.fromEntries((tracks ?? []).map((track) => [track.id, track.name])),
+    }),
+    [tracks]
+  );
+  const handleReviewed = () => {
+    refetch();
+    queryClient.invalidateQueries({ queryKey: ["admin-candidate"] });
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 p-4">
@@ -131,7 +277,7 @@ function SessionReviewModal({ sessionId, onClose }: { sessionId: string; onClose
             <h2 className="text-lg font-bold text-text-primary">Session Review</h2>
             {session ? (
               <p className="mt-1 text-sm text-text-secondary">
-                {TRACK_NAMES[session.trackId] ?? session.trackId} · {MODE_LABELS[session.mode] ?? session.mode} ·{" "}
+                {trackNames[session.trackId] ?? session.trackId} · {MODE_LABELS[session.mode] ?? session.mode} ·{" "}
                 {formatDuration(session.durationSeconds)} · {formatDate(session.completedAt)}
               </p>
             ) : null}
@@ -176,7 +322,13 @@ function SessionReviewModal({ sessionId, onClose }: { sessionId: string; onClose
                   </p>
                   <div className="space-y-3">
                     {phaseResult.answers.map((answer, index) => (
-                      <ReviewAnswerCard key={answer.questionId} answer={answer} index={index} />
+                      <ReviewAnswerCard
+                        key={answer.questionId}
+                        sessionId={session.id}
+                        answer={answer}
+                        index={index}
+                        onReviewed={handleReviewed}
+                      />
                     ))}
                   </div>
                 </div>
@@ -189,14 +341,20 @@ function SessionReviewModal({ sessionId, onClose }: { sessionId: string; onClose
   );
 }
 
-function AssessmentCard({ assessment }: { assessment: CandidateAssessment }) {
+function AssessmentCard({
+  assessment,
+  trackNames,
+}: {
+  assessment: CandidateAssessment;
+  trackNames: Record<string, string>;
+}) {
   const [expanded, setExpanded] = useState(false);
 
   return (
     <div className="rounded-2xl border border-border bg-background-card p-5">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <p className="text-sm font-semibold text-text-primary">{TRACK_NAMES[assessment.trackId] ?? assessment.trackId}</p>
+          <p className="text-sm font-semibold text-text-primary">{trackNames[assessment.trackId] ?? assessment.trackId}</p>
           <p className="text-xs text-text-muted">
             {assessment.skillLevel.charAt(0).toUpperCase() + assessment.skillLevel.slice(1)} level · {formatDate(assessment.createdAt)}
           </p>
@@ -238,6 +396,37 @@ function AssessmentCard({ assessment }: { assessment: CandidateAssessment }) {
               <p className="mt-1 text-sm text-text-secondary">{item.userAnswer}</p>
               <p className="mt-2 text-xs font-semibold uppercase tracking-wide text-text-muted">Feedback</p>
               <p className="mt-1 text-sm text-text-secondary">{item.feedback}</p>
+              {item.scoreRationale ? (
+                <>
+                  <p className="mt-2 text-xs font-semibold uppercase tracking-wide text-text-muted">Score Rationale</p>
+                  <p className="mt-1 text-sm text-text-secondary">{item.scoreRationale}</p>
+                </>
+              ) : null}
+              {item.criteriaScores && Object.keys(item.criteriaScores).length > 0 ? (
+                <div className="mt-3 flex flex-wrap gap-2">
+                  {Object.entries(item.criteriaScores).map(([criterion, value]) => (
+                    <span key={criterion} className="rounded-full bg-background-card px-2.5 py-1 text-xs text-text-muted">
+                      {criterion.replace(/_/g, " ")}:{" "}
+                      <span className="font-semibold text-text-secondary">{value}/10</span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {((item.confidence !== null && item.confidence !== undefined) || (item.reviewFlags?.length ?? 0) > 0) ? (
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {item.confidence !== null && item.confidence !== undefined ? (
+                    <span className="rounded-full bg-background-card px-2.5 py-1 text-xs text-text-muted">
+                      confidence:{" "}
+                      <span className="font-semibold text-text-secondary">{Math.round(item.confidence * 100)}%</span>
+                    </span>
+                  ) : null}
+                  {(item.reviewFlags ?? []).map((flag) => (
+                    <span key={flag} className="rounded-full bg-warning/15 px-2.5 py-1 text-xs font-medium text-warning">
+                      {flag.replace(/_/g, " ")}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
             </div>
           ))}
         </div>
@@ -256,6 +445,17 @@ export default function CandidateDetailPage() {
     queryFn: () => adminApi.getCandidate(candidateId),
     enabled: !!candidateId,
   });
+  const { data: tracks } = useQuery({
+    queryKey: ["admin-tracks"],
+    queryFn: adminApi.getTracks,
+  });
+  const trackNames = useMemo(
+    () => ({
+      ...TRACK_NAMES,
+      ...Object.fromEntries((tracks ?? []).map((track) => [track.id, track.name])),
+    }),
+    [tracks]
+  );
 
   if (isLoading) {
     return (
@@ -359,7 +559,11 @@ export default function CandidateDetailPage() {
         ) : null}
 
         {tab === "sessions" ? (
-          <SessionHistoryTable sessions={sessions} onReview={(session: InterviewSessionResult) => setReviewingSessionId(session.id)} />
+          <SessionHistoryTable
+            sessions={sessions}
+            trackNames={trackNames}
+            onReview={(session: InterviewSessionResult) => setReviewingSessionId(session.id)}
+          />
         ) : null}
 
         {tab === "assessments" ? (
@@ -370,7 +574,7 @@ export default function CandidateDetailPage() {
           ) : (
             <div className="space-y-4">
               {assessments.map((assessment) => (
-                <AssessmentCard key={assessment.id} assessment={assessment} />
+                <AssessmentCard key={assessment.id} assessment={assessment} trackNames={trackNames} />
               ))}
             </div>
           )

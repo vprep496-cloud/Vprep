@@ -5,13 +5,7 @@ export type UserRole = "candidate" | "admin" | "superadmin";
 
 export type SkillLevel = "beginner" | "intermediate" | "advanced";
 
-export type TrackId =
-  | "ml_ai"
-  | "web_dev"
-  | "devops"
-  | "data_science"
-  | "cloud"
-  | "mobile_dev";
+export type TrackId = string;
 
 export interface AdminUser {
   id: string;
@@ -39,8 +33,8 @@ export interface StatCard {
 // ---------------------------------------------------------------------------
 
 export type InterviewMode = "hr" | "technical" | "behavioral" | "full_mock";
-export type InterviewPhase = "hr" | "technical" | "behavioral";
-export type AnswerType = "voice" | "text";
+export type InterviewPhase = "hr" | "technical" | "coding_logic" | "behavioral";
+export type AnswerType = "voice" | "text" | "image";
 export type Difficulty = "easy" | "medium" | "hard";
 
 export interface TrackSummary {
@@ -50,6 +44,8 @@ export interface TrackSummary {
   icon: string;
   color: string;
   totalDays: number;
+  topicAreas: string[];
+  isActive?: boolean;
 }
 
 export interface DashboardStats {
@@ -94,8 +90,16 @@ export interface QuestionFeedback {
   question: string;
   userAnswer: string;
   score: number;
+  criteriaScores?: Record<string, number>;
+  confidence?: number | null;
+  strengths?: string[];
+  improvements?: string[];
+  reviewFlags?: string[];
+  evidence?: string[];
+  scoreRationale?: string | null;
   feedback: string;
   modelAnswer: string;
+  scoringMetadata?: Record<string, unknown> | null;
 }
 
 export interface CandidateAssessment {
@@ -106,6 +110,7 @@ export interface CandidateAssessment {
   score: number;
   breakdown: Record<string, number>;
   perQuestionFeedback: QuestionFeedback[];
+  scoringVersion?: string | null;
   createdAt: string;
 }
 
@@ -116,10 +121,30 @@ export interface InterviewQuestionAnswer {
   answerType: AnswerType;
   transcription: string | null;
   userTextAnswer: string | null;
+  answerDurationSeconds?: number | null;
   score: number;
   criteriaScores: Record<string, number>;
   feedback: string;
   modelAnswer: string;
+  confidence?: number | null;
+  strengths?: string[];
+  improvements?: string[];
+  reviewFlags?: string[];
+  evidence?: string[];
+  scoreRationale?: string | null;
+  rubricVersion?: string | null;
+  scoringMode?: string | null;
+  scoringMetadata?: Record<string, unknown> | null;
+  aiScore?: number | null;
+  aiCriteriaScores?: Record<string, number> | null;
+  aiFeedback?: string | null;
+  aiConfidence?: number | null;
+  aiReviewFlags?: string[];
+  aiScoringMetadata?: Record<string, unknown> | null;
+  manualReviewStatus?: "pending" | "reviewed" | "not_required" | null;
+  reviewerNotes?: string | null;
+  reviewedBy?: string | null;
+  reviewedAt?: string | null;
 }
 
 export interface InterviewPhaseResult {
@@ -181,6 +206,32 @@ export interface QuestionInput {
   tags: string[];
 }
 
+export interface QuestionGenerateInput {
+  trackId: string;
+  phase: InterviewPhase;
+  count: number;
+  difficulty?: Difficulty;
+  guidance?: string;
+}
+
+export interface TrackInput {
+  id?: string;
+  name: string;
+  description: string;
+  icon: string;
+  color: string;
+  totalDays: number;
+  topicAreas: string[];
+}
+
+export interface ManualReviewInput {
+  score?: number;
+  criteriaScores?: Record<string, number>;
+  feedback?: string;
+  reviewerNotes?: string;
+  status?: "pending" | "reviewed" | "not_required";
+}
+
 export interface ScoreTrendPoint {
   date: string;
   averageScore: number;
@@ -203,4 +254,27 @@ export interface AdminAnalytics {
   scoreTrend: ScoreTrendPoint[];
   trackDistribution: TrackDistributionPoint[];
   sessionCompletion: SessionCompletionPoint[];
+}
+
+export interface AIStatus {
+  provider: string;
+  configured: boolean;
+  sdk: string;
+  keyFingerprint: string | null;
+  models: {
+    text: string;
+    json: string;
+    multimodal: string;
+    health: string;
+  };
+  generation: {
+    temperature: number;
+    creativeTemperature: number;
+    topP: number;
+    maxOutputTokens: number;
+  };
+  live?: {
+    ok: boolean;
+    message: string;
+  };
 }

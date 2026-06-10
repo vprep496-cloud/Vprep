@@ -25,10 +25,10 @@ export default function DataTable<T>({
   emptyMessage = "No results found",
 }: DataTableProps<T>) {
   return (
-    <div className="overflow-hidden rounded-2xl border border-border bg-background-card">
+    <div className="overflow-hidden rounded-2xl border border-border-soft bg-background-card shadow-soft">
       <table className="w-full text-left text-sm">
         <thead>
-          <tr className="border-b border-border bg-background-surface">
+          <tr className="border-b border-border-soft bg-background-surface">
             {columns.map((column) => (
               <th key={column.key} className="px-4 py-3 font-semibold text-text-secondary">
                 {column.label}
@@ -39,7 +39,7 @@ export default function DataTable<T>({
         <tbody>
           {loading ? (
             Array.from({ length: SKELETON_ROWS }).map((_, rowIndex) => (
-              <tr key={`skeleton-${rowIndex}`} className="border-b border-border last:border-0">
+              <tr key={`skeleton-${rowIndex}`} className="border-b border-border-soft last:border-0">
                 {columns.map((column) => (
                   <td key={column.key} className="px-4 py-4">
                     <div className="h-4 w-3/4 animate-pulse rounded bg-background-surface" />
@@ -59,7 +59,7 @@ export default function DataTable<T>({
               return (
                 <tr
                   key={(record.id as string | undefined) ?? rowIndex}
-                  className="border-b border-border text-text-primary last:border-0 hover:bg-white/5 transition-colors duration-150"
+                  className="border-b border-border-soft text-text-primary last:border-0 transition-colors duration-150 hover:bg-background-elevated"
                 >
                   {columns.map((column) => (
                     <td key={column.key} className="px-4 py-3">

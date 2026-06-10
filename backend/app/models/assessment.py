@@ -7,7 +7,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.enrollment import SkillLevel
 from app.models.track import TrackId
@@ -21,6 +21,8 @@ class AssessmentQuestion(BaseModel):
     id: str
     question: str
     topic_area: str
+    section_id: str | None = None
+    section_title: str | None = None
     difficulty: Difficulty
 
 
@@ -31,8 +33,16 @@ class QuestionFeedback(BaseModel):
     question: str
     user_answer: str
     score: int  # 0-10
+    criteria_scores: dict[str, int] = Field(default_factory=dict)
+    confidence: float | None = None
+    strengths: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+    review_flags: list[str] = Field(default_factory=list)
+    evidence: list[str] = Field(default_factory=list)
+    score_rationale: str | None = None
     feedback: str
     model_answer: str
+    scoring_metadata: dict | None = None
 
 
 class AssessmentResult(BaseModel):
@@ -45,6 +55,7 @@ class AssessmentResult(BaseModel):
     score: int  # overall score, 0-100
     breakdown: dict[str, int]  # topic_area -> score, scaled 0-100
     per_question_feedback: list[QuestionFeedback]
+    scoring_version: str | None = None
     created_at: datetime
 
 

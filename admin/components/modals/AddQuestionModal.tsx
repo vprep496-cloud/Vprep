@@ -5,13 +5,14 @@ import axios from "axios";
 import { Loader2 } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
-import { ANSWER_TYPE_BY_PHASE, DIFFICULTY_OPTIONS, PHASE_OPTIONS, TRACK_OPTIONS } from "@/lib/tracks";
+import { ANSWER_TYPE_BY_PHASE, DIFFICULTY_OPTIONS, PHASE_OPTIONS, type TrackOption } from "@/lib/tracks";
 import type { Difficulty, InterviewPhase, QuestionInput, TrackId } from "@/types";
 
 interface AddQuestionModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess: () => void;
+  trackOptions: TrackOption[];
 }
 
 interface FormState {
@@ -65,7 +66,7 @@ function csvToList(value: string): string[] {
 // (and which a 400 would then bounce back), the form derives it from `phase`
 // via `ANSWER_TYPE_BY_PHASE` (the same map `admin.py` validates against) and
 // surfaces it as a read-only badge for transparency.
-export default function AddQuestionModal({ isOpen, onClose, onSuccess }: AddQuestionModalProps) {
+export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOptions }: AddQuestionModalProps) {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -145,7 +146,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess }: AddQues
                   <option value="" disabled>
                     Select a track
                   </option>
-                  {TRACK_OPTIONS.map((track) => (
+                  {trackOptions.map((track) => (
                     <option key={track.id} value={track.id}>
                       {track.name}
                     </option>
@@ -176,7 +177,11 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess }: AddQues
               <p className="mt-3 text-xs text-text-muted">
                 Answer type for this phase is fixed:{" "}
                 <span className="font-semibold text-text-secondary">
-                  {derivedAnswerType === "voice" ? "Voice response" : "Typed response"}
+                  {derivedAnswerType === "voice"
+                    ? "Voice response"
+                    : derivedAnswerType === "image"
+                      ? "Image upload"
+                      : "Typed response"}
                 </span>
               </p>
             ) : null}

@@ -4,15 +4,12 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
-from app.api.v1.tracks import TRACKS_BY_ID
+from app.api.v1.tracks import get_track_or_none
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.services import assessment_service
 
 router = APIRouter()
-
-_VALID_TRACK_IDS = set(TRACKS_BY_ID.keys())
-
 
 class TrackIdBody(BaseModel):
     track_id: str
@@ -24,8 +21,8 @@ class SubmitBody(BaseModel):
     answers: dict[str, str]
 
 
-def _validate_track_id(track_id: str) -> None:
-    if track_id not in _VALID_TRACK_IDS:
+async def _validate_track_id(track_id: str, db: AsyncIOMotorDatabase) -> None:
+    if await get_track_or_none(track_id, db) is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Unknown track_id.",
@@ -36,9 +33,10 @@ def _validate_track_id(track_id: str) -> None:
 async def generate_questions(
     payload: TrackIdBody,
     current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Generate a fresh 7-question assessment session for the given track."""
-    _validate_track_id(payload.track_id)
+    await _validate_track_id(payload.track_id, db)
 
     session_id, questions = await assessment_service.generate_questions(
         payload.track_id, current_user["id"]
@@ -54,6 +52,8 @@ async def submit_assessment(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Score a completed assessment session and generate the personalized plan."""
+    await _validate_track_id(payload.track_id, db)
+
     session = await db["assessment_sessions"].find_one({"session_id": payload.session_id})
     if session is None:
         raise HTTPException(
@@ -91,8 +91,9 @@ async def submit_assessment(
         "skill_level": scoring["skill_level"],
         "score": scoring["score"],
         "breakdown": scoring["breakdown"],
-        "answers": payload.answers,
+        "answers": scoring.get("answers", payload.answers),
         "per_question_feedback": scoring["per_question_feedback"],
+        "scoring_version": scoring.get("scoring_version"),
         "created_at": now,
     }
     insert_result = await db["assessments"].insert_one(dict(assessment_doc))
@@ -116,9 +117,10 @@ async def submit_assessment(
 async def get_result(
     track_id: str,
     current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Return the most recent saved assessment result + plan for this track, if any."""
-    _validate_track_id(track_id)
+    await _validate_track_id(track_id, db)
 
     result, plan = await assessment_service.get_existing_result(current_user["id"], track_id)
     return {"result": result, "plan": plan}
@@ -131,7 +133,7 @@ async def get_plan(
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Return the most recent personalized plan for this track, or 404 if none exists."""
-    _validate_track_id(track_id)
+    await _validate_track_id(track_id, db)
 
     plan = await db["plans"].find_one(
         {"user_id": current_user["id"], "track_id": track_id},
@@ -151,9 +153,10 @@ async def get_plan(
 async def retake_assessment(
     payload: TrackIdBody,
     current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Start a brand-new assessment session without deleting prior history."""
-    _validate_track_id(payload.track_id)
+    await _validate_track_id(payload.track_id, db)
 
     session_id, questions = await assessment_service.generate_questions(
         payload.track_id, current_user["id"]
