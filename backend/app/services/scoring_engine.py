@@ -4,7 +4,7 @@ from typing import Any, Literal
 
 from fastapi import HTTPException, status
 
-from app.services.gemini import generate_json, generate_multimodal_json
+from app.services.ai_provider import generate_json, generate_media_json
 
 logger = logging.getLogger("vprep.scoring_engine")
 
@@ -247,15 +247,15 @@ def _build_interview_prompt(
     media_instruction = ""
     if include_transcription and mode in {"hr_voice", "behavioral_voice"}:
         media_instruction = (
-            "The candidate's spoken answer is attached as audio. First transcribe the answer "
-            "faithfully, including meaningful pauses, filler words, and false starts where audible. "
-            "Then score only the job-relevant answer content and communication clarity.\n\n"
+            "The backend has already transcribed the candidate's spoken answer using local speech-to-text. "
+            "Use the extracted transcript as the transcription field, then score only the job-relevant "
+            "answer content and communication clarity.\n\n"
         )
     elif include_transcription:
         media_instruction = (
-            "The candidate's handwritten coding solution is attached as an image. First extract the "
-            "solution text and symbols as faithfully as possible. Use [unclear] for unreadable parts. "
-            "Then score the logic, not artistic neatness.\n\n"
+            "The backend has already extracted text from the candidate's handwritten coding image using local OCR. "
+            "Use the extracted solution as the transcription field. Score the algorithmic logic, edge cases, "
+            "and complexity awareness, not artistic neatness.\n\n"
         )
 
     answer_block = ""
@@ -376,7 +376,7 @@ async def _call_json_with_retry(
             max_output_tokens=max_output_tokens,
         )
     except Exception as first_error:
-        logger.warning("Gemini scoring JSON call failed, retrying once: %s", first_error)
+        logger.warning("Local AI scoring JSON call failed, retrying once: %s", first_error)
         try:
             return await generate_json(
                 prompt + _RETRY_SUFFIX,
@@ -386,10 +386,14 @@ async def _call_json_with_retry(
                 max_output_tokens=max_output_tokens,
             )
         except Exception as second_error:
-            logger.error("Gemini scoring JSON call failed after retry: %s", second_error)
+            logger.error("Local AI scoring JSON call failed after retry: %s", second_error)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI scoring service temporarily unavailable. Please try again.",
+                detail=getattr(
+                    second_error,
+                    "user_message",
+                    "Local AI scoring service temporarily unavailable. Please try again.",
+                ),
             )
 
 
@@ -402,7 +406,7 @@ async def _call_multimodal_json_with_retry(
     max_output_tokens: int = 3072,
 ):
     try:
-        return await generate_multimodal_json(
+        return await generate_media_json(
             prompt,
             media_bytes=media_bytes,
             mime_type=mime_type,
@@ -411,9 +415,9 @@ async def _call_multimodal_json_with_retry(
             max_output_tokens=max_output_tokens,
         )
     except Exception as first_error:
-        logger.warning("Gemini multimodal scoring call failed, retrying once: %s", first_error)
+        logger.warning("Local media scoring call failed, retrying once: %s", first_error)
         try:
-            return await generate_multimodal_json(
+            return await generate_media_json(
                 prompt + _RETRY_SUFFIX,
                 media_bytes=media_bytes,
                 mime_type=mime_type,
@@ -422,10 +426,14 @@ async def _call_multimodal_json_with_retry(
                 max_output_tokens=max_output_tokens,
             )
         except Exception as second_error:
-            logger.error("Gemini multimodal scoring call failed after retry: %s", second_error)
+            logger.error("Local media scoring call failed after retry: %s", second_error)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI scoring service temporarily unavailable. Please try again.",
+                detail=getattr(
+                    second_error,
+                    "user_message",
+                    "Local AI media scoring service temporarily unavailable. Please try again.",
+                ),
             )
 
 
@@ -624,7 +632,7 @@ def _normalize_scored_answer(
         "evidence": evidence,
         "score_rationale": score_rationale,
         "media_duration_seconds": media_duration_seconds,
-        "provider": "gemini",
+        "provider": "ollama",
     }
 
     result: dict[str, Any] = {

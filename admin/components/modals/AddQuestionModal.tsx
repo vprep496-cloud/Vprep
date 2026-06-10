@@ -227,7 +227,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
             </label>
 
             <label className={`${LABEL_CLASS} mt-4`}>
-              Model Answer <span className="text-text-muted">(the rubric Gemini scores against — never shown to candidates up front)</span>
+              Model Answer <span className="text-text-muted">(the rubric local AI scores against — never shown to candidates up front)</span>
               <textarea
                 value={form.modelAnswer}
                 onChange={(event) => update("modelAnswer", event.target.value)}

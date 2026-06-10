@@ -72,7 +72,7 @@ export default function GenerateQuestionsModal({
       onClose();
     } catch (err) {
       const detail = axios.isAxiosError(err) ? err.response?.data?.detail : null;
-      setError(typeof detail === "string" ? detail : "Gemini could not generate questions right now.");
+      setError(typeof detail === "string" ? detail : "Local AI could not generate questions right now.");
     } finally {
       setIsSubmitting(false);
     }
@@ -88,7 +88,7 @@ export default function GenerateQuestionsModal({
               <h2 className="text-lg font-bold text-text-primary">Generate Questions</h2>
             </div>
             <p className="mt-1 text-sm text-text-secondary">
-              Create a Gemini-generated batch and save it directly to the question bank.
+              Create a local AI-generated batch and save it directly to the question bank.
             </p>
 
             <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">

@@ -3,7 +3,7 @@ import logging
 from fastapi import HTTPException, status
 
 from app.core.config import get_settings
-from app.services.gemini import generate_json
+from app.services.ai_provider import generate_json
 
 logger = logging.getLogger("vprep.admin_ai_service")
 _settings = get_settings()
@@ -22,18 +22,22 @@ _DEFAULT_CRITERIA = {
 }
 
 
-async def _call_gemini_json(prompt: str):
+async def _call_ai_json(prompt: str):
     try:
         return await generate_json(prompt, temperature=_settings.AI_CREATIVE_TEMPERATURE)
     except Exception as first_error:
-        logger.warning("Gemini admin generation failed, retrying once: %s", first_error)
+        logger.warning("Local AI admin generation failed, retrying once: %s", first_error)
         try:
             return await generate_json(prompt + _RETRY_SUFFIX, temperature=_settings.AI_CREATIVE_TEMPERATURE)
         except Exception as second_error:
-            logger.error("Gemini admin generation failed after retry: %s", second_error)
+            logger.error("Local AI admin generation failed after retry: %s", second_error)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI generation service temporarily unavailable. Please try again.",
+                detail=getattr(
+                    second_error,
+                    "user_message",
+                    "Local AI generation service temporarily unavailable. Please try again.",
+                ),
             )
 
 
@@ -110,7 +114,7 @@ async def generate_question_documents(
     guidance: str | None,
 ) -> list[dict]:
     prompt = _build_question_prompt(track, phase, count, difficulty, guidance)
-    raw_questions = await _call_gemini_json(prompt)
+    raw_questions = await _call_ai_json(prompt)
     if not isinstance(raw_questions, list):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

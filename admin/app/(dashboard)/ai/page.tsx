@@ -40,8 +40,8 @@ function ModelsPanel({ status }: { status: AIStatus }) {
       <div className="mt-3">
         <SettingRow label="Text model" value={status.models.text} />
         <SettingRow label="JSON model" value={status.models.json} />
-        <SettingRow label="Audio/image model" value={status.models.multimodal} />
-        <SettingRow label="Health-check model" value={status.models.health} />
+        <SettingRow label="Scoring model" value={status.models.scoring} />
+        <SettingRow label="Media reasoning model" value={status.models.mediaReasoning} />
       </div>
     </div>
   );
@@ -71,7 +71,7 @@ export default function AIPage() {
     <div>
       <PageHeader
         title="AI Configuration"
-        description="Gemini provider status, model routing, and live key validation."
+        description="Local Ollama provider status, model routing, and live model validation."
         actions={
           <button
             type="button"
@@ -98,16 +98,19 @@ export default function AIPage() {
                 <KeyRound size={18} className="text-primary-400" />
                 <h2 className="text-base font-bold text-text-primary">Provider</h2>
               </div>
-              <StatusPill ok={current.configured} label={current.configured ? "Configured" : "Missing key"} />
+              <StatusPill ok={current.configured} label={current.configured ? "Configured" : "Needs setup"} />
             </div>
 
             <div className="mt-4">
               <SettingRow label="Provider" value={current.provider} />
               <SettingRow label="SDK" value={current.sdk} />
-              <SettingRow label="Key fingerprint" value={current.keyFingerprint} />
+              <SettingRow label="Ollama endpoint" value={current.endpoint ?? "Not set"} />
               <SettingRow label="Scoring temperature" value={current.generation.temperature} />
               <SettingRow label="Creative temperature" value={current.generation.creativeTemperature} />
               <SettingRow label="Max output tokens" value={current.generation.maxOutputTokens} />
+              <SettingRow label="Request timeout" value={current.generation.requestTimeoutSeconds ?? null} />
+              <SettingRow label="Image OCR" value={current.media?.imageOcr ?? null} />
+              <SettingRow label="Voice transcription" value={current.media?.audioTranscription ?? null} />
             </div>
 
             {current.live ? (
@@ -117,6 +120,11 @@ export default function AIPage() {
                   <StatusPill ok={current.live.ok} label={current.live.ok ? "Passed" : "Failed"} />
                 </div>
                 <p className="mt-2 text-sm text-text-secondary">{current.live.message}</p>
+                {current.live.availableModels?.length ? (
+                  <p className="mt-1 text-xs text-text-muted">
+                    Available models: {current.live.availableModels.join(", ")}
+                  </p>
+                ) : null}
               </div>
             ) : null}
           </div>

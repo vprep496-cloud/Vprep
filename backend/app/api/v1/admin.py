@@ -27,7 +27,7 @@ from app.api.v1.tracks import get_track_catalog, get_track_or_none, get_tracks_b
 from app.core.database import get_db
 from app.core.dependencies import require_role
 from app.services import admin_ai_service
-from app.services.gemini import get_ai_status, live_health_check
+from app.services.ai_provider import get_ai_status, live_health_check
 from app.services.interview_service import to_session_result
 
 router = APIRouter()

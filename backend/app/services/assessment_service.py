@@ -1,18 +1,20 @@
-# Phase 3 — all Gemini interactions for the dynamic assessment + plan feature
-# live here. Routers in app/api/v1/assessment.py stay thin and only handle
-# request validation, ownership checks, and persistence orchestration.
+# Dynamic assessment + plan generation. Routers in app/api/v1/assessment.py
+# stay thin and only handle request validation, ownership checks, and
+# persistence orchestration.
+import asyncio
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import BackgroundTasks
 from fastapi import HTTPException, status
 
 from app.api.v1.tracks import get_track_or_none
 from app.core.config import get_settings
 from app.core.database import get_db
 from app.services.profile_service import normalize_level
-from app.services.gemini import generate_json
+from app.services.ai_provider import generate_json
 from app.services.scoring_engine import RUBRIC_VERSION, score_assessment_batch
 
 logger = logging.getLogger("vprep.assessment_service")
@@ -26,9 +28,8 @@ _MAX_RAW_SCORE = _QUESTION_COUNT * 10  # 70 — every answer scored 0-10
 # the track's nominal `total_days` (which is just a display figure on the card).
 _PLAN_DAYS_BY_SKILL_LEVEL = {"beginner": 30, "intermediate": 21, "advanced": 14}
 
-# Required tail of every Gemini prompt in this phase (Gemini Prompt Rule #1).
-# generate_json() in gemini.py also appends its own JSON-only instruction —
-# the two are complementary, not conflicting; extra emphasis only helps.
+# Required tail of every local-AI prompt in this phase. generate_json() also
+# appends its own JSON-only instruction; the two are complementary.
 _JSON_ONLY_SUFFIX = (
     "\n\nRespond ONLY with valid JSON. No markdown, no backticks, no preamble, "
     "no explanation. Start immediately with `[` or `{`."
@@ -39,23 +40,40 @@ _RETRY_SUFFIX = (
 )
 
 
-async def _call_gemini_json(prompt: str, *, temperature: float | None = None):
-    """Call generate_json, retrying once on parse failure (Gemini Prompt Rule #5).
+async def _call_ai_json(
+    prompt: str,
+    *,
+    temperature: float | None = None,
+    max_output_tokens: int | None = None,
+):
+    """Call generate_json through local Ollama, retrying once on parse failure.
 
     If both the original call and the single retry fail to produce valid JSON,
     raise HTTP 503 so the client can show "AI service temporarily unavailable."
     """
     try:
-        return await generate_json(prompt, temperature=temperature)
+        return await generate_json(
+            prompt,
+            temperature=temperature,
+            max_output_tokens=max_output_tokens,
+        )
     except Exception as first_error:
-        logger.warning("Gemini JSON generation failed, retrying once: %s", first_error)
+        logger.warning("Local AI JSON generation failed, retrying once: %s", first_error)
         try:
-            return await generate_json(prompt + _RETRY_SUFFIX, temperature=temperature)
+            return await generate_json(
+                prompt + _RETRY_SUFFIX,
+                temperature=temperature,
+                max_output_tokens=max_output_tokens,
+            )
         except Exception as second_error:
-            logger.error("Gemini JSON generation failed after retry: %s", second_error)
+            logger.error("Local AI JSON generation failed after retry: %s", second_error)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="AI service temporarily unavailable. Please try again.",
+                detail=getattr(
+                    second_error,
+                    "user_message",
+                    "Local AI service temporarily unavailable. Please try again.",
+                ),
             )
 
 
@@ -90,20 +108,46 @@ async def _candidate_profile_context(user_id: str, db) -> dict[str, Any]:
         "years_experience": (user or {}).get("years_experience") or profile.get("years_experience"),
         "skills": profile.get("skills") if isinstance(profile.get("skills"), list) else [],
         "projects": profile.get("projects") if isinstance(profile.get("projects"), list) else [],
+        "primary_roles": profile.get("primary_roles") if isinstance(profile.get("primary_roles"), list) else [],
+        "education": profile.get("education") if isinstance(profile.get("education"), list) else [],
         "summary": (user or {}).get("cv_summary") or profile.get("summary"),
     }
 
 
+def _compact_text(value: Any, *, max_chars: int = 160) -> str:
+    text = " ".join(str(value or "").replace("\n", " ").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "."
+
+
+def _compact_list_text(items: Any, *, limit: int, max_item_chars: int = 90) -> str:
+    if not isinstance(items, list):
+        return ""
+    cleaned = [_compact_text(item, max_chars=max_item_chars) for item in items]
+    return ", ".join(item for item in cleaned[:limit] if item)
+
+
 def _profile_prompt_context(profile: dict[str, Any]) -> str:
-    skills = ", ".join(str(skill) for skill in profile.get("skills", [])[:10])
-    projects = "; ".join(str(project) for project in profile.get("projects", [])[:3])
+    skills = _compact_list_text(profile.get("skills"), limit=10, max_item_chars=70)
+    projects = "; ".join(
+        _compact_text(project, max_chars=110)
+        for project in (profile.get("projects", []) if isinstance(profile.get("projects"), list) else [])[:5]
+    )
+    roles = _compact_list_text(profile.get("primary_roles"), limit=4, max_item_chars=80)
+    education = "; ".join(
+        _compact_text(item, max_chars=90)
+        for item in (profile.get("education", []) if isinstance(profile.get("education"), list) else [])[:3]
+    )
     return (
         f"Candidate level: {profile['level']}\n"
         f"Target role: {profile.get('target_role') or 'not provided'}\n"
+        f"Previous role signals: {roles or 'not provided'}\n"
         f"Years of experience: {profile.get('years_experience') if profile.get('years_experience') is not None else 'not provided'}\n"
         f"CV/profile summary: {profile.get('summary') or 'not provided'}\n"
         f"Relevant skills from CV/onboarding: {skills or 'not provided'}\n"
-        f"Relevant projects from CV/onboarding: {projects or 'not provided'}"
+        f"Relevant projects from CV/onboarding: {projects or 'not provided'}\n"
+        f"Education/certification signals: {education or 'not provided'}"
     )
 
 
@@ -124,7 +168,14 @@ def _build_questions_prompt(track_name: str, topic_areas: list[str], profile: di
         "interviewer would ask in a screening call for this role. The questions "
         "should read exactly like a real interviewer speaking out loud — not "
         "textbook definitions, not trivia — and should prompt the candidate to "
-        "demonstrate real understanding, not just recall facts. Specifically:\n"
+        "demonstrate real understanding, not just recall facts.\n\n"
+        "Personalization rules:\n"
+        "- At least 3 questions must reference the candidate's CV-derived skills, projects, target role, or experience level in a generic professional way\n"
+        "- At least 2 questions must be reusable predefined-style fundamentals from the track topic areas, so the assessment has calibration anchors across users\n"
+        "- If projects are available, ask at least 1 applied question that connects a project-like scenario to one track topic without revealing personal identifiers\n"
+        "- If years of experience are available, calibrate seniority: junior candidates get implementation/debugging questions; senior candidates get tradeoff/architecture/production judgment\n"
+        "- Never include names, employers, schools, exact personal dates, phone numbers, or emails\n\n"
+        "Question quality rules:\n"
         "- Every question must be fully open-ended: no yes/no answers, no "
         "multiple choice, no options or correct-answer fields of any kind\n"
         "- Questions must be personalized to the candidate's level: beginner "
@@ -160,6 +211,95 @@ def _build_questions_prompt(track_name: str, topic_areas: list[str], profile: di
     )
 
     return intro + body + _JSON_ONLY_SUFFIX
+
+
+def _build_remaining_questions_prompt(
+    track_name: str,
+    topic_areas: list[str],
+    profile: dict[str, Any],
+    seed_questions: list[dict],
+) -> str:
+    topic_list = ", ".join(topic_areas)
+    seed_context = "\n".join(
+        f"{question['id']}: {question['question']} | topic={question['topic_area']} | difficulty={question['difficulty']}"
+        for question in seed_questions
+    )
+    return (
+        "You are improving an in-progress technical screening assessment. "
+        "Question q1 is already shown to the candidate and must not be changed. "
+        "Generate only q2 through q7.\n\n"
+        f"Track: {track_name}\n"
+        f"Track topics: {topic_list}\n"
+        f"Candidate profile:\n{_profile_prompt_context(profile)}\n\n"
+        "Current seed questions for continuity:\n"
+        f"{seed_context}\n\n"
+        "Quality requirements:\n"
+        "- Questions must sound like a real interviewer, not a textbook or quiz app.\n"
+        "- Every question must be answerable in 2-4 precise sentences.\n"
+        "- q2 must be easy and calibration-friendly.\n"
+        "- q3-q5 must be medium practical reasoning questions tied to track topics and CV/project signals when available.\n"
+        "- q6-q7 must be hard applied judgment questions calibrated to the candidate level and experience.\n"
+        "- At least three questions must use the candidate's skills, projects, target role, or years of experience in a generic professional way.\n"
+        "- Prefer realistic interview scenarios over broad prompts like 'explain the importance of X'.\n"
+        "- Do not ask the candidate to write long essays, lists of many items, or code in this text assessment.\n"
+        "- Never include personal identifiers, names, employers, schools, exact dates, emails, or phone numbers.\n"
+        "- Include concise server-side model_answer rubrics.\n\n"
+        "Return a JSON array of exactly 6 objects, ids q2 through q7, using this schema:\n"
+        "[\n"
+        "  {\n"
+        '    "id": "q2",\n'
+        '    "question": "...",\n'
+        '    "topic_area": "...",\n'
+        '    "section_id": "fundamentals",\n'
+        '    "section_title": "Fundamentals",\n'
+        '    "difficulty": "easy",\n'
+        '    "model_answer": "..."\n'
+        "  }\n"
+        "]"
+        + _JSON_ONLY_SUFFIX
+    )
+
+
+def _build_single_remaining_question_prompt(
+    track_name: str,
+    topic_areas: list[str],
+    profile: dict[str, Any],
+    seed_questions: list[dict],
+    question_number: int,
+) -> str:
+    seed = seed_questions[question_number - 1]
+    section = _section_for_question(question_number)
+    difficulty = "easy" if question_number <= 2 else "medium" if question_number <= 5 else "hard"
+    topic_list = ", ".join(topic_areas)
+    return (
+        "You are improving one question in a progressive technical screening assessment. "
+        f"Generate exactly one replacement for q{question_number}.\n\n"
+        f"Track: {track_name}\n"
+        f"Track topics: {topic_list}\n"
+        f"Candidate profile:\n{_profile_prompt_context(profile)}\n\n"
+        "Current seed question to improve:\n"
+        f"q{question_number}: {seed['question']}\n"
+        f"Seed topic: {seed.get('topic_area', 'General')}\n"
+        f"Seed rubric: {seed.get('model_answer', '')}\n\n"
+        "Rules:\n"
+        "- The question must sound like a real interviewer speaking in a screening call.\n"
+        "- It must be personalized to the candidate's level, track, CV skills/projects, or target role when useful.\n"
+        "- It must be answerable in 2-4 precise sentences.\n"
+        "- Do not ask for code, essays, lists of many items, or personal identifiers.\n"
+        "- Never include names, employers, schools, exact dates, emails, or phone numbers.\n"
+        "- Include a concise server-side model_answer rubric.\n\n"
+        "Return one JSON object using exactly this schema:\n"
+        "{\n"
+        f'  "id": "q{question_number}",\n'
+        '  "question": "...",\n'
+        f'  "topic_area": "{seed.get("topic_area", "General")}",\n'
+        f'  "section_id": "{section["section_id"]}",\n'
+        f'  "section_title": "{section["section_title"]}",\n'
+        f'  "difficulty": "{difficulty}",\n'
+        '  "model_answer": "..."\n'
+        "}"
+        + _JSON_ONLY_SUFFIX
+    )
 
 
 def _build_scoring_prompt(qa_items: list[dict]) -> str:
@@ -257,78 +397,435 @@ def _normalize_generated_questions(raw_questions: Any) -> list[dict]:
     return usable[:_QUESTION_COUNT]
 
 
-def _fallback_questions(track: dict, profile: dict[str, Any]) -> list[dict]:
+def _normalize_question_candidate(raw: Any, seed: dict, index: int) -> dict | None:
+    if isinstance(raw, str):
+        raw = {"question": raw}
+    if not isinstance(raw, dict):
+        return None
+
+    section = _section_for_question(index)
+    difficulty = str(raw.get("difficulty") or seed.get("difficulty") or "").strip().lower()
+    question = str(raw.get("question") or raw.get("question_text") or "").strip()
+    model_answer = str(raw.get("model_answer") or seed.get("model_answer") or "").strip()
+    if not question or not model_answer:
+        return None
+
+    return {
+        "id": f"q{index}",
+        "question": question,
+        "topic_area": str(raw.get("topic_area") or raw.get("topic") or seed.get("topic_area") or "General").strip(),
+        "section_id": str(raw.get("section_id") or seed.get("section_id") or section["section_id"]).strip(),
+        "section_title": str(raw.get("section_title") or seed.get("section_title") or section["section_title"]).strip(),
+        "difficulty": difficulty if difficulty in {"easy", "medium", "hard"} else (
+            "easy" if index <= 2 else "medium" if index <= 5 else "hard"
+        ),
+        "model_answer": model_answer,
+    }
+
+
+def _coerce_question_list(raw: Any) -> list[dict] | None:
+    """Accept common local-model JSON variants for question generation.
+
+    llama3.2:3b often follows the content requirements but wraps arrays inside
+    an object or uses q2/q3 keys. Keeping this coercion narrow lets us recover
+    good generations without accepting arbitrary malformed content.
+    """
+    if isinstance(raw, list):
+        return raw
+
+    if not isinstance(raw, dict):
+        return None
+
+    for key in ("questions", "items", "results", "assessment_questions"):
+        value = raw.get(key)
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            nested = _coerce_question_list(value)
+            if nested:
+                return nested
+
+    keyed_questions = []
+    for index in range(2, _QUESTION_COUNT + 1):
+        value = raw.get(f"q{index}") or raw.get(str(index))
+        if isinstance(value, dict):
+            keyed_questions.append(value)
+        elif isinstance(value, str) and value.strip():
+            keyed_questions.append({"id": f"q{index}", "question": value.strip()})
+    if keyed_questions:
+        return keyed_questions
+
+    dict_values = [
+        value
+        for value in raw.values()
+        if isinstance(value, dict) and (value.get("question") or value.get("question_text"))
+    ]
+    return dict_values or None
+
+
+def _prepare_remaining_question_candidates(
+    raw_questions: list[Any],
+    seed_questions: list[dict],
+) -> list[dict]:
+    prepared: list[dict] = []
+    for offset, item in enumerate(raw_questions[: _QUESTION_COUNT - 1], start=2):
+        if isinstance(item, str):
+            raw = {"question": item}
+        elif isinstance(item, dict):
+            raw = dict(item)
+        else:
+            continue
+
+        seed = seed_questions[offset - 1] if len(seed_questions) >= offset else {}
+        raw.setdefault("id", f"q{offset}")
+        raw.setdefault("topic_area", seed.get("topic_area", "General"))
+        raw.setdefault("section_id", seed.get("section_id"))
+        raw.setdefault("section_title", seed.get("section_title"))
+        raw.setdefault("difficulty", seed.get("difficulty"))
+        raw.setdefault("model_answer", seed.get("model_answer", ""))
+        prepared.append(raw)
+    return prepared
+
+
+def _compact_profile_signal(profile: dict[str, Any], key: str, fallback: str) -> str:
+    value = profile.get(key)
+    if isinstance(value, list):
+        return _compact_text(value[0], max_chars=80) if value else fallback
+    text = _compact_text(value, max_chars=80)
+    return text or fallback
+
+
+def _experience_phrase(profile: dict[str, Any]) -> str:
+    years = profile.get("years_experience")
+    level = profile.get("level", "beginner")
+    if years is None:
+        return f"{level}-level"
+    try:
+        number = float(years)
+    except (TypeError, ValueError):
+        return f"{level}-level"
+    if number < 1:
+        return "early-career"
+    if number < 4:
+        return f"{number:g}-year"
+    return f"{number:g}-year senior"
+
+
+async def _load_predefined_assessment_anchors(db, track_id: str, profile: dict[str, Any]) -> list[dict]:
+    """Load fast reusable technical anchors from the admin question bank.
+
+    These anchors give the assessment stable calibration questions. They are a
+    supplement to the personalized deterministic questions, not a dependency:
+    if the admin bank is empty or Mongo sampling fails, the assessment still
+    starts immediately from local seed templates.
+    """
+    preferred = {"beginner": "easy", "intermediate": "medium", "advanced": "hard"}.get(
+        profile.get("level", "beginner"),
+        "medium",
+    )
+    anchors: list[dict] = []
+
+    async def sample(extra_match: dict[str, Any] | None, remaining: int) -> None:
+        if remaining <= 0:
+            return
+        match: dict[str, Any] = {"phase": "technical", "track_id": track_id}
+        if extra_match:
+            match.update(extra_match)
+        if anchors:
+            seen_texts = [anchor["question_text"] for anchor in anchors]
+            match["question_text"] = {"$nin": seen_texts}
+        pipeline = [{"$match": match}, {"$sample": {"size": remaining}}]
+        async for document in db["questions"].aggregate(pipeline):
+            question_text = _compact_text(document.get("question_text"), max_chars=240)
+            model_answer = _compact_text(document.get("model_answer"), max_chars=260)
+            if question_text and model_answer:
+                anchors.append(
+                    {
+                        "question_text": question_text,
+                        "model_answer": model_answer,
+                        "difficulty": document.get("difficulty") or preferred,
+                        "tags": document.get("tags") or [],
+                    }
+                )
+
+    try:
+        await sample({"difficulty": preferred}, 2)
+        await sample(None, 2 - len(anchors))
+    except Exception as exc:
+        logger.warning("Could not load predefined assessment anchors: %s", exc)
+        return []
+
+    return anchors[:2]
+
+
+def _fallback_questions(
+    track: dict,
+    profile: dict[str, Any],
+    predefined_anchors: list[dict] | None = None,
+) -> list[dict]:
     topics = track.get("topic_areas") or [track.get("name", "Interview fundamentals")]
     level = profile["level"]
     target_role = profile.get("target_role") or track.get("name", "the role")
+    track_name = track.get("name", target_role)
+    skill = _compact_profile_signal(profile, "skills", topics[0])
+    experience = _experience_phrase(profile)
+    level_article = "an" if level[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+    anchor = (predefined_anchors or [None])[0] or {}
+    anchor_question = anchor.get("question_text") or (
+        f"Explain {topics[1 % len(topics)]} in {track_name}. What should a strong candidate understand beyond the definition?"
+    )
+    anchor_answer = anchor.get("model_answer") or (
+        "A strong answer defines the concept accurately, explains why it matters, "
+        "and gives a practical example with relevant tradeoffs or risks."
+    )
+
+    level_instruction = {
+        "beginner": "focus on correct fundamentals, simple tradeoffs, and debugging basics.",
+        "intermediate": "probe practical tradeoffs, implementation details, testing, and failure modes.",
+        "advanced": "probe architecture judgment, production risk, scalability, and stakeholder tradeoffs.",
+    }.get(level, "probe practical reasoning.")
 
     templates = [
         (
             "easy",
             "fundamentals",
             "Fundamentals",
-            "Explain {topic} in simple terms and why it matters for a {target_role}.",
-            "A strong answer defines the concept accurately, states why it matters, and gives one practical example.",
+            "You are preparing for a {target_role}. Explain {topic} in the context of {track_name}, then give one realistic mistake {level_article} {level} candidate should avoid.",
+            "A strong answer defines the topic accurately, connects it to the role, gives one concrete example, and names a realistic mistake with a prevention strategy.",
         ),
         (
             "easy",
             "fundamentals",
             "Fundamentals",
-            "What is one common mistake candidates make with {topic}, and how would you avoid it?",
-            "A strong answer names a realistic mistake, explains the risk, and gives a clear prevention strategy.",
+            "{anchor_question}",
+            "{anchor_answer}",
         ),
         (
             "medium",
             "practical_reasoning",
             "Practical Reasoning",
-            "How would you decide between two approaches for {topic} in a real project?",
-            "A strong answer compares tradeoffs such as complexity, reliability, cost, data, or maintainability.",
+            "Your profile mentions {skill}. In one of your CV projects or practice projects, how would you decide between two approaches for {topic}?",
+            "A strong answer compares real tradeoffs such as correctness, maintainability, performance, delivery risk, user impact, and evidence from testing or metrics.",
         ),
         (
             "medium",
             "practical_reasoning",
             "Practical Reasoning",
-            "Describe how your {level}-level experience would help you debug a problem involving {topic}.",
-            "A strong answer describes a systematic debugging process, relevant signals, and a concrete next step.",
+            "As a {experience} candidate, imagine a {track_name} feature involving {topic} behaves incorrectly but the symptoms are unclear. How would you debug it?",
+            "A strong answer describes systematic diagnosis, relevant logs or signals, isolation steps, likely root causes, and a concrete next action before changing code or configuration.",
         ),
         (
             "medium",
             "practical_reasoning",
             "Practical Reasoning",
-            "What metrics or evidence would you use to know whether work on {topic} is successful?",
-            "A strong answer identifies meaningful metrics, explains why they fit the goal, and notes a limitation.",
+            "What tests, metrics, or review evidence would convince you that a solution involving {topic} is ready for a real interview-level project?",
+            "A strong answer identifies meaningful validation signals, explains why they fit the goal, and notes edge cases, false positives, or limitations.",
         ),
         (
             "hard",
             "applied_judgment",
             "Applied Judgment",
-            "Imagine a production system using {topic} starts failing intermittently. What would you investigate first?",
-            "A strong answer prioritizes diagnosis, observability, recent changes, failure scope, and safe mitigation.",
+            "Imagine a production {track_name} system involving {topic} starts failing intermittently. What would you investigate first, and how would you reduce user impact while you diagnose it?",
+            "A strong answer prioritizes observability, recent changes, failure scope, rollback or mitigation, root-cause isolation, communication, and a plan to verify recovery.",
         ),
         (
             "hard",
             "applied_judgment",
             "Applied Judgment",
-            "How would you explain a tradeoff in {topic} to a non-technical stakeholder?",
-            "A strong answer is accurate, concise, business-aware, and avoids unnecessary jargon.",
+            "For your level, interviewers will {level_instruction} How would you explain a difficult tradeoff in {topic} to a non-technical stakeholder without losing technical accuracy?",
+            "A strong answer is technically accurate, business-aware, concise, and frames tradeoffs in terms of risk, cost, user value, delivery timing, and reversibility.",
         ),
     ]
 
     questions = []
     for index, (difficulty, section_id, section_title, template, model_answer) in enumerate(templates, start=1):
         topic = topics[(index - 1) % len(topics)]
+        format_args = {
+            "topic": topic,
+            "target_role": target_role,
+            "track_name": track_name,
+            "skill": skill,
+            "experience": experience,
+            "level": level,
+            "level_article": level_article,
+            "level_instruction": level_instruction,
+            "anchor_question": anchor_question,
+            "anchor_answer": anchor_answer,
+        }
         questions.append(
             {
                 "id": f"q{index}",
-                "question": template.format(topic=topic, target_role=target_role, level=level),
+                "question": template.format(**format_args),
                 "topic_area": topic,
                 "section_id": section_id,
                 "section_title": section_title,
                 "difficulty": difficulty,
-                "model_answer": model_answer,
+                "model_answer": model_answer.format(**format_args),
             }
         )
     return questions
+
+
+def _sanitize_questions(questions: list[dict]) -> list[dict]:
+    return [{key: value for key, value in question.items() if key != "model_answer"} for question in questions]
+
+
+def _question_number(question_id: str) -> int | None:
+    if not question_id.startswith("q"):
+        return None
+    try:
+        return int(question_id[1:])
+    except ValueError:
+        return None
+
+
+async def _refine_remaining_questions_individually(
+    session_id: str,
+    track: dict,
+    profile: dict[str, Any],
+    seed_questions: list[dict],
+) -> bool:
+    db = get_db()
+    topic_areas = track.get("topic_areas") or [track.get("name", "Interview fundamentals")]
+    generated_by_id: dict[str, dict] = {}
+
+    for index in range(2, _QUESTION_COUNT + 1):
+        latest = await db["assessment_sessions"].find_one({"session_id": session_id})
+        if latest is None or latest.get("completed"):
+            return False
+        served_indexes = set(int(item) for item in latest.get("served_question_indexes", []))
+        if index in served_indexes:
+            continue
+
+        prompt = _build_single_remaining_question_prompt(
+            track["name"],
+            topic_areas,
+            profile,
+            seed_questions,
+            index,
+        )
+        try:
+            raw = await asyncio.wait_for(
+                _call_ai_json(
+                    prompt,
+                    temperature=_settings.AI_CREATIVE_TEMPERATURE,
+                    max_output_tokens=1024,
+                ),
+                timeout=18,
+            )
+            raw_item: Any
+            if isinstance(raw, dict) and (raw.get("question") or raw.get("question_text")):
+                raw_item = raw
+            else:
+                raw_items = _coerce_question_list(raw)
+                raw_item = raw_items[0] if raw_items else raw
+            question = _normalize_question_candidate(raw_item, seed_questions[index - 1], index)
+        except Exception as exc:
+            logger.warning("Single assessment question refinement failed for q%s: %s", index, exc)
+            continue
+
+        if question:
+            generated_by_id[question["id"]] = question
+
+    if not generated_by_id:
+        return False
+
+    latest = await db["assessment_sessions"].find_one({"session_id": session_id})
+    if latest is None or latest.get("completed"):
+        return False
+
+    served_indexes = set(int(item) for item in latest.get("served_question_indexes", []))
+    current_questions = list(latest.get("questions", seed_questions))
+    changed = False
+    for index in range(2, _QUESTION_COUNT + 1):
+        if index in served_indexes:
+            continue
+        next_question = generated_by_id.get(f"q{index}")
+        if next_question:
+            current_questions[index - 1] = next_question
+            changed = True
+
+    if not changed:
+        return False
+
+    await db["assessment_sessions"].update_one(
+        {"session_id": session_id},
+        {
+            "$set": {
+                "questions": current_questions,
+                "generation_status": "completed",
+                "generation_completed_at": datetime.now(timezone.utc),
+                "question_source": "progressive_ollama_individual",
+            }
+        },
+    )
+    return True
+
+
+async def _refine_remaining_questions(session_id: str, track_id: str, profile: dict[str, Any]) -> None:
+    db = get_db()
+    track = await get_track_or_none(track_id, db)
+    if track is None:
+        return
+
+    session = await db["assessment_sessions"].find_one({"session_id": session_id})
+    if session is None or session.get("completed"):
+        return
+
+    seed_questions = session.get("questions", [])
+    topic_areas = track.get("topic_areas") or [track.get("name", "Interview fundamentals")]
+    prompt = _build_remaining_questions_prompt(track["name"], topic_areas, profile, seed_questions)
+    try:
+        raw = await _call_ai_json(
+            prompt,
+            temperature=_settings.AI_CREATIVE_TEMPERATURE,
+            max_output_tokens=4096,
+        )
+        raw_questions = _coerce_question_list(raw)
+        if not isinstance(raw_questions, list):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="AI service returned an unexpected question format.",
+            )
+        prepared_questions = _prepare_remaining_question_candidates(raw_questions, seed_questions)
+        generated = _normalize_generated_questions([seed_questions[0], *prepared_questions])[1:]
+    except Exception as exc:
+        logger.warning("Batch assessment refinement failed; trying single-question refinement: %s", exc)
+        if await _refine_remaining_questions_individually(session_id, track, profile, seed_questions):
+            return
+        logger.warning("Progressive assessment refinement failed; keeping seed questions: %s", exc)
+        await db["assessment_sessions"].update_one(
+            {"session_id": session_id},
+            {"$set": {"generation_status": "fallback", "generation_error": str(exc)[:240]}},
+        )
+        return
+
+    latest = await db["assessment_sessions"].find_one({"session_id": session_id})
+    if latest is None or latest.get("completed"):
+        return
+
+    served_indexes = set(int(index) for index in latest.get("served_question_indexes", []))
+    current_questions = list(latest.get("questions", seed_questions))
+    by_id = {question["id"]: question for question in generated}
+    changed = False
+
+    for index in range(2, _QUESTION_COUNT + 1):
+        if index in served_indexes:
+            continue
+        next_question = by_id.get(f"q{index}")
+        if next_question:
+            current_questions[index - 1] = next_question
+            changed = True
+
+    update: dict[str, Any] = {
+        "generation_status": "completed" if changed else "completed_no_changes",
+        "generation_completed_at": datetime.now(timezone.utc),
+        "question_source": "progressive_ollama",
+    }
+    if changed:
+        update["questions"] = current_questions
+
+    await db["assessment_sessions"].update_one({"session_id": session_id}, {"$set": update})
 
 
 def _build_plan_prompt(track_name: str, topic_areas: list[str], skill_level: str, total_days: int) -> str:
@@ -443,12 +940,16 @@ def _fallback_plan_data(track: dict, skill_level: str, total_days: int) -> dict:
 # ---------------------------------------------------------------------------
 
 
-async def generate_questions(track_id: str, user_id: str) -> tuple[str, list[dict]]:
-    """Generate 7 fresh interview-style questions for `track_id`.
+async def generate_questions(
+    track_id: str,
+    user_id: str,
+    background_tasks: BackgroundTasks | None = None,
+) -> tuple[str, list[dict]]:
+    """Start a progressive 7-question assessment session for `track_id`.
 
-    Persists the full question set (including model_answer) to
-    `assessment_sessions`, then returns (session_id, sanitized_questions) where
-    sanitized_questions has model_answer stripped from every item.
+    The first personalized seed question is returned immediately. Questions
+    q2-q7 are seeded too, so the user is never blocked; a background task then
+    refines unserved questions with local AI while q1 is being answered.
     """
     db = get_db()
     track = await get_track_or_none(track_id, db)
@@ -456,16 +957,9 @@ async def generate_questions(track_id: str, user_id: str) -> tuple[str, list[dic
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
 
     profile = await _candidate_profile_context(user_id, db)
-    prompt = _build_questions_prompt(track["name"], track["topic_areas"], profile)
-    try:
-        questions = _normalize_generated_questions(
-            await _call_gemini_json(prompt, temperature=_settings.AI_CREATIVE_TEMPERATURE)
-        )
-        question_source = "gemini"
-    except HTTPException as exc:
-        logger.warning("Gemini assessment question generation failed; using fallback questions: %s", exc.detail)
-        questions = _fallback_questions(track, profile)
-        question_source = "fallback"
+    predefined_anchors = await _load_predefined_assessment_anchors(db, track_id, profile)
+    questions = _fallback_questions(track, profile, predefined_anchors)
+    question_source = "progressive_seed"
 
     session_id = str(uuid.uuid4())
     await db["assessment_sessions"].insert_one(
@@ -475,22 +969,54 @@ async def generate_questions(track_id: str, user_id: str) -> tuple[str, list[dic
             "track_id": track_id,
             "questions": questions,
             "candidate_profile_snapshot": profile,
+            "predefined_anchor_count": len(predefined_anchors),
             "question_source": question_source,
+            "generation_status": "pending",
+            "served_question_indexes": [1],
             "completed": False,
             "created_at": datetime.now(timezone.utc),
         }
     )
 
-    sanitized_questions = [
-        {key: value for key, value in question.items() if key != "model_answer"}
-        for question in questions
-    ]
+    if background_tasks is not None:
+        background_tasks.add_task(_refine_remaining_questions, session_id, track_id, profile)
 
-    return session_id, sanitized_questions
+    return session_id, _sanitize_questions(questions[:1])
+
+
+async def get_session_question(session_id: str, user_id: str, question_number: int) -> dict:
+    if question_number < 1 or question_number > _QUESTION_COUNT:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found.")
+
+    db = get_db()
+    session = await db["assessment_sessions"].find_one({"session_id": session_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Assessment session not found.")
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="This assessment session does not belong to you.")
+    if session.get("completed"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This assessment has already been submitted.")
+
+    questions = session.get("questions", [])
+    question = questions[question_number - 1] if len(questions) >= question_number else None
+    if not question:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found.")
+
+    await db["assessment_sessions"].update_one(
+        {"session_id": session_id},
+        {"$addToSet": {"served_question_indexes": question_number}},
+    )
+
+    return {
+        "question": _sanitize_questions([question])[0],
+        "question_number": question_number,
+        "total": _QUESTION_COUNT,
+        "generation_status": session.get("generation_status", "pending"),
+    }
 
 
 async def score_answers(session_id: str, answers: dict[str, str]) -> dict:
-    """Score all 7 answers in ONE Gemini call and derive skill level + breakdown."""
+    """Score all 7 answers in one local AI call and derive skill level + breakdown."""
     db = get_db()
     session = await db["assessment_sessions"].find_one({"session_id": session_id})
     if session is None:
@@ -600,11 +1126,11 @@ async def generate_plan(user_id: str, track_id: str, skill_level: str) -> dict:
     total_days = _PLAN_DAYS_BY_SKILL_LEVEL[skill_level]
 
     prompt = _build_plan_prompt(track["name"], track["topic_areas"], skill_level, total_days)
-    plan_source = "gemini"
+    plan_source = "ollama"
     try:
-        plan_data = await _call_gemini_json(prompt, temperature=_settings.AI_CREATIVE_TEMPERATURE)
+        plan_data = await _call_ai_json(prompt, temperature=_settings.AI_CREATIVE_TEMPERATURE)
     except HTTPException as exc:
-        logger.warning("Gemini plan generation failed; using local fallback plan: %s", exc.detail)
+        logger.warning("Local AI plan generation failed; using deterministic fallback plan: %s", exc.detail)
         plan_data = _fallback_plan_data(track, skill_level, total_days)
         plan_source = "fallback"
 

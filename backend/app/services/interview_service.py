@@ -1,4 +1,4 @@
-# Phase 5 — mock interview orchestration: question sampling, Gemini scoring
+# Phase 5 — mock interview orchestration: question sampling, local AI scoring
 # (voice + text), session completion/scoring math, and history. Routers in
 # app/api/v1/interview.py stay thin and only handle request validation,
 # ownership checks, and persistence orchestration — mirroring the Phase 3/4
@@ -143,21 +143,28 @@ async def _candidate_profile_for_interview(
         "skill_level": normalize_level(skill_level),
         "target_role": (user or {}).get("target_role") or profile.get("target_role"),
         "skills": profile.get("skills") if isinstance(profile.get("skills"), list) else [],
+        "projects": profile.get("projects") if isinstance(profile.get("projects"), list) else [],
         "primary_roles": profile.get("primary_roles") if isinstance(profile.get("primary_roles"), list) else [],
+        "years_experience": (user or {}).get("years_experience") or profile.get("years_experience"),
+        "summary": (user or {}).get("cv_summary") or profile.get("summary"),
         "profile_confidence": profile.get("confidence"),
     }
 
 
 def _auto_fill_guidance(phase: str, candidate_profile: dict[str, Any]) -> str:
     skills = ", ".join(str(skill) for skill in candidate_profile.get("skills", [])[:8])
+    projects = "; ".join(str(project) for project in candidate_profile.get("projects", [])[:4])
     roles = ", ".join(str(role) for role in candidate_profile.get("primary_roles", [])[:4])
     target_role = candidate_profile.get("target_role")
+    years = candidate_profile.get("years_experience")
     level = candidate_profile["skill_level"]
 
     return (
         f"Auto-fill a reusable question-bank shortage for {level}-level candidates. "
         f"Target role context: {target_role or roles or 'general candidate for this track'}. "
+        f"Years of experience signal: {years if years is not None else 'not provided'}. "
         f"Relevant skills to reflect when useful: {skills or 'use the track topic areas'}. "
+        f"Project-style signals to reflect generically when useful: {projects or 'not provided'}. "
         "Do not include candidate names, employers, schools, or any personal identifiers. "
         "Create professional interview questions that can safely be reused for similar candidates. "
         f"Phase needing questions: {phase}."
@@ -186,7 +193,7 @@ def _fallback_question_documents(
 
     hr_questions = [
         f"Walk me through your background and why you are preparing for a {target_role}.",
-        f"What makes you interested in {track_name}, and how does it connect to your recent learning or work?",
+        f"What makes you interested in {track_name}, and how does it connect to your recent learning, projects, or work?",
         "Describe a strength you would bring to a team and a skill you are actively improving.",
         "Tell me about a time you had to explain a complex idea clearly to someone else.",
     ]
@@ -211,8 +218,9 @@ def _fallback_question_documents(
             )
         elif phase == "coding_logic":
             question_text = (
-                "Handwrite an algorithm to process a list of inputs, detect duplicates, and return the "
-                "unique values in stable order. Include time/space complexity and at least two edge cases."
+            "On paper, handwrite an algorithm to process a list of inputs, detect duplicates, and return the "
+            "unique values in stable order. Capture a clear photo of your solution, including time/space "
+            "complexity and at least two edge cases."
             )
             model_answer = (
                 "A strong solution uses a set for seen values, preserves insertion order in the output, "
@@ -274,7 +282,7 @@ async def _auto_fill_missing_questions(
         source = "ai_auto_fill"
     except Exception as exc:
         logger.warning(
-            "Gemini question auto-fill failed; using local fallback. phase=%s track_id=%s error=%s",
+            "Local AI question auto-fill failed; using local fallback. phase=%s track_id=%s error=%s",
             phase,
             track_id,
             exc,
@@ -346,7 +354,7 @@ async def _ensure_question_supply(
 
 
 def _audio_mime_type(audio_format: str | None) -> str:
-    """Map the client-reported recording format to a Gemini-friendly mime type.
+    """Map the client-reported recording format to a local extraction mime type.
 
     `VoiceRecorder.tsx` always records HIGH_QUALITY presets, which default to
     m4a — "audio/wav" is accepted as a defensive fallback per the spec's
@@ -399,6 +407,10 @@ async def start_session(user_id: str, track_id: str, mode: str, db: AsyncIOMotor
         "candidate_profile_snapshot": {
             "skill_level": candidate_profile["skill_level"],
             "target_role": candidate_profile.get("target_role"),
+            "years_experience": candidate_profile.get("years_experience"),
+            "skills": candidate_profile.get("skills", [])[:12],
+            "projects": candidate_profile.get("projects", [])[:5],
+            "summary": candidate_profile.get("summary"),
             "profile_confidence": candidate_profile.get("profile_confidence"),
         },
         "answers": [],
@@ -446,7 +458,7 @@ async def score_text_answer(question: dict, text_answer: str) -> dict:
 
 
 async def score_text_answers_batch(questions: list[dict], answers_by_id: dict[str, str]) -> list[dict]:
-    """Score a full technical text section in one Gemini call."""
+    """Score a full technical text section in one local AI call."""
     qa_items = [
         {
             "id": question["id"],
@@ -485,7 +497,7 @@ async def score_text_answers_batch(questions: list[dict], answers_by_id: dict[st
                 "scoring_metadata": evaluation.get("scoring_metadata") or {
                     "rubric_version": raw_result.get("rubric_version", RUBRIC_VERSION),
                     "scoring_mode": raw_result.get("scoring_mode", "technical_text_batch"),
-                    "provider": "gemini",
+                    "provider": "ollama",
                 },
             }
         )

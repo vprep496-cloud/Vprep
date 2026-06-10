@@ -146,9 +146,8 @@ async def submit_answer(
         "score": max(0, min(int(scored.get("overall_score", 0)), 100)),
         "criteria_scores": scored.get("criteria_scores", {}),
         "feedback": scored.get("feedback", ""),
-        # Falls back to the question bank's own model_answer if Gemini omits
-        # one — it's the same text either way (we feed it to Gemini as the
-        # rubric and ask it to echo it back, mirroring assessment_service).
+        # Falls back to the question bank's own model_answer if the local AI
+        # omits one. It is the same rubric text we pass into the scoring prompt.
         "model_answer": scored.get("model_answer") or question.get("model_answer", ""),
         "confidence": scored.get("confidence"),
         "strengths": scored.get("strengths", []),
@@ -197,7 +196,7 @@ async def submit_text_answer_batch(
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Score a whole technical text section in one Gemini call."""
+    """Score a whole technical text section in one local AI call."""
     object_id = _object_id_or_404(payload.session_id)
     session = await _get_owned_session(payload.session_id, current_user["id"], db)
 

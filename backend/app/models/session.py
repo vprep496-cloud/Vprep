@@ -1,7 +1,7 @@
 # Phase 5 — full mock-interview session models.
 #
 # Mirrors the open-ended philosophy already established in assessment.py:
-# every answer (voice or text) is graded holistically by Gemini against a
+# every answer (voice, text, or image) is graded holistically by local AI against a
 # server-side `model_answer` rubric that the candidate never sees mid-session
 # (Agent Rule #3) — only afterward, as feedback on their own AnswerResponse.
 from datetime import datetime

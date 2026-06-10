@@ -8,7 +8,7 @@ from app.api.v1 import admin, assessment, auth, interview, tracks, users
 from app.core.config import get_settings
 from app.core.database import close_db, connect_db
 from app.core.security import init_firebase
-from app.services.gemini import get_ai_status
+from app.services.ai_provider import get_ai_status
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("vprep.main")

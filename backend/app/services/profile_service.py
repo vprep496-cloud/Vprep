@@ -1,7 +1,7 @@
 import logging
 from typing import Any
 
-from app.services.gemini import AIConfigurationError, generate_multimodal_json
+from app.services.ai_provider import AIConfigurationError, generate_media_json
 
 logger = logging.getLogger("vprep.profile_service")
 
@@ -191,7 +191,7 @@ async def build_candidate_profile(
     )
 
     try:
-        raw = await generate_multimodal_json(
+        raw = await generate_media_json(
             prompt,
             media_bytes=cv_bytes,
             mime_type=cv_mime_type or "application/pdf",
@@ -200,7 +200,7 @@ async def build_candidate_profile(
             temperature=0.0,
         )
     except AIConfigurationError as exc:
-        logger.warning("CV extraction skipped because Gemini is not configured: %s", exc)
+        logger.warning("CV extraction skipped because local AI is not configured: %s", exc)
         return _fallback_profile(
             self_reported_level=self_reported_level,
             target_role=target_role,

@@ -15,16 +15,13 @@ class Settings(BaseSettings):
     # Firebase
     FIREBASE_SERVICE_ACCOUNT_PATH: str = "./firebase-service-account.json"
 
-    # AI provider / Gemini. Keep keys server-side only; mobile/admin clients
-    # should call backend endpoints and never receive the raw API key.
-    AI_PROVIDER: str = "gemini"
-    GEMINI_API_KEY: str = ""
-    GOOGLE_API_KEY: str = ""
-    GEMINI_TEXT_MODEL: str = "gemini-3.5-flash"
-    GEMINI_JSON_MODEL: str = "gemini-3.5-flash"
-    GEMINI_SCORING_MODEL: str = "gemini-3.5-flash"
-    GEMINI_MULTIMODAL_MODEL: str = "gemini-3.5-flash"
-    GEMINI_HEALTH_MODEL: str = "gemini-3.1-flash-lite"
+    # Local AI provider. Mobile/admin clients call this FastAPI backend only;
+    # the backend then talks to Ollama on the laptop through LangChain.
+    AI_PROVIDER: str = "ollama"
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_MODEL: str = "llama3.2:3b"
+    OLLAMA_REQUEST_TIMEOUT_SECONDS: int = 120
+    OLLAMA_HEALTH_TIMEOUT_SECONDS: int = 5
     AI_TEMPERATURE: float = 0.2
     AI_CREATIVE_TEMPERATURE: float = 0.7
     AI_TOP_P: float = 0.95
@@ -41,12 +38,8 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
 
     @property
-    def gemini_api_key(self) -> str:
-        return self.GEMINI_API_KEY or self.GOOGLE_API_KEY
-
-    @property
     def ai_configured(self) -> bool:
-        return self.AI_PROVIDER == "gemini" and bool(self.gemini_api_key)
+        return self.AI_PROVIDER == "ollama" and bool(self.OLLAMA_BASE_URL and self.OLLAMA_MODEL)
 
 
 @lru_cache()

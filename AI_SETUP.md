@@ -1,87 +1,57 @@
-# V-Prep AI Setup
+# Local AI Setup
 
-V-Prep uses Gemini through the backend only. Do not put `GEMINI_API_KEY` in the
-mobile app or the Next admin app.
+V-Prep now uses a local AI backend only. The React Native app calls FastAPI
+over HTTP; FastAPI talks to Ollama through LangChain.
 
-## 1. Create the key
-
-Create a Gemini API key in Google AI Studio:
-
-https://aistudio.google.com/app/apikey
-
-Add it to `vprep/backend/.env`:
-
-```env
-GEMINI_API_KEY=your-real-key
-```
-
-`GOOGLE_API_KEY` is supported as a fallback, but prefer `GEMINI_API_KEY` so the
-deployment is explicit.
-
-## 2. Install the current Gemini SDK
-
-From `vprep/backend`:
+## 1. Install and pull the model
 
 ```bash
+ollama pull llama3.2:3b
+```
+
+Ollama must be reachable from the backend laptop at:
+
+```bash
+http://localhost:11434
+```
+
+## 2. Start the backend
+
+```bash
+cd interview-ai-backend
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The backend uses Google’s current `google-genai` SDK, not the legacy
-`google-generativeai` package.
+## 3. Configure the mobile app
 
-## 3. Model routing
-
-Defaults:
-
-```env
-GEMINI_TEXT_MODEL=gemini-2.5-flash
-GEMINI_JSON_MODEL=gemini-2.5-flash
-GEMINI_MULTIMODAL_MODEL=gemini-2.5-flash
-GEMINI_HEALTH_MODEL=gemini-2.5-flash
-```
-
-Where each route is used:
-
-- `GEMINI_TEXT_MODEL`: plain text generation.
-- `GEMINI_JSON_MODEL`: assessment questions, scoring JSON, plans, admin-generated questions.
-- `GEMINI_MULTIMODAL_MODEL`: voice transcription/scoring and handwritten coding-logic image scoring.
-- `GEMINI_HEALTH_MODEL`: low-cost live setup check.
-
-## 4. Professional safety model
-
-- Candidate apps never receive the Gemini key.
-- Admin status shows only a SHA-256 key fingerprint, never the key itself.
-- Scoring uses low temperature for consistent evaluation.
-- Admin question/plan generation uses a higher creative temperature.
-- Model names are environment-driven so you can upgrade without code changes.
-
-## 5. Verify setup
-
-Start the backend and check:
+Use the laptop LAN IP, not localhost:
 
 ```bash
-curl http://localhost:8000/health
+EXPO_PUBLIC_API_URL=http://192.168.1.5:8000
 ```
 
-Then open the admin dashboard and go to **AI**. Press **Run Live Check** to make
-a real Gemini request and confirm the key/model works.
+Change `192.168.1.5` to your laptop IP.
 
-## 6. Recommended production environment
+## 4. Media extraction
 
-Set these variables in your hosting provider’s secret manager:
+`llama3.2:3b` is text-only, so the backend extracts media content first:
 
-```env
-AI_PROVIDER=gemini
-GEMINI_API_KEY=...
-GEMINI_TEXT_MODEL=gemini-2.5-flash
-GEMINI_JSON_MODEL=gemini-2.5-flash
-GEMINI_MULTIMODAL_MODEL=gemini-2.5-flash
-GEMINI_HEALTH_MODEL=gemini-2.5-flash
-AI_TEMPERATURE=0.2
-AI_CREATIVE_TEMPERATURE=0.7
-AI_TOP_P=0.95
-AI_MAX_OUTPUT_TOKENS=8192
+- CV PDFs: `pypdf`
+- CV and coding images: `pytesseract` + `pillow`
+- Voice recordings: optional `faster-whisper`
+
+Install the Tesseract system binary on the laptop for OCR.
+
+## 5. Health check
+
+Open:
+
+```bash
+http://localhost:8000/health
 ```
 
-Rotate the key immediately if it is ever pasted into frontend code, committed
-to git, shared in screenshots, or exposed in logs.
+The admin portal also exposes a live Ollama check under AI Configuration.

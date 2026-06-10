@@ -2,7 +2,7 @@
 #
 # Design note: assessments are 100% short-answer / open-ended. There is no
 # multiple-choice, no `options`, no `correct_answer` anywhere in this phase —
-# Gemini grades free-typed answers holistically against a server-side rubric
+# Local AI grades free-typed answers holistically against a server-side rubric
 # (`model_answer`) that is never exposed to the candidate before they submit.
 from datetime import datetime
 from typing import Literal
@@ -27,7 +27,7 @@ class AssessmentQuestion(BaseModel):
 
 
 class QuestionFeedback(BaseModel):
-    """Gemini's per-question evaluation of the candidate's typed answer."""
+    """Local AI per-question evaluation of the candidate's typed answer."""
 
     question_id: str
     question: str

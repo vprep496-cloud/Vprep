@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 
@@ -32,17 +32,36 @@ async def _validate_track_id(track_id: str, db: AsyncIOMotorDatabase) -> None:
 @router.post("/generate-questions")
 async def generate_questions(
     payload: TrackIdBody,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
-    """Generate a fresh 7-question assessment session for the given track."""
+    """Start a progressive assessment session for the given track.
+
+    The first question returns immediately. Remaining questions are available
+    from deterministic seed prompts and refined in the background by local AI.
+    """
     await _validate_track_id(payload.track_id, db)
 
     session_id, questions = await assessment_service.generate_questions(
-        payload.track_id, current_user["id"]
+        payload.track_id, current_user["id"], background_tasks
     )
 
     return {"session_id": session_id, "questions": questions, "track_id": payload.track_id}
+
+
+@router.get("/session/{session_id}/question/{question_number}")
+async def get_session_question(
+    session_id: str,
+    question_number: int,
+    current_user: dict = Depends(get_current_user),
+):
+    """Return one assessment question by number without exposing model_answer."""
+    return await assessment_service.get_session_question(
+        session_id,
+        current_user["id"],
+        question_number,
+    )
 
 
 @router.post("/submit")
@@ -152,6 +171,7 @@ async def get_plan(
 @router.post("/retake")
 async def retake_assessment(
     payload: TrackIdBody,
+    background_tasks: BackgroundTasks,
     current_user: dict = Depends(get_current_user),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
@@ -159,7 +179,7 @@ async def retake_assessment(
     await _validate_track_id(payload.track_id, db)
 
     session_id, questions = await assessment_service.generate_questions(
-        payload.track_id, current_user["id"]
+        payload.track_id, current_user["id"], background_tasks
     )
 
     return {"session_id": session_id, "questions": questions, "track_id": payload.track_id}

@@ -109,7 +109,7 @@ DEMO_CANDIDATES: list[dict[str, Any]] = [
 
 # ---------------------------------------------------------------------------
 # Per-track topic areas (used to build realistic assessment breakdowns).
-# Mirrors the rubric keys the Gemini service actually uses so that the admin
+# Mirrors the rubric keys the local AI scoring service actually uses so that the admin
 # portal's assessment tab renders recognisable labels.
 # ---------------------------------------------------------------------------
 TOPIC_AREAS: dict[str, list[str]] = {

@@ -260,21 +260,28 @@ export interface AIStatus {
   provider: string;
   configured: boolean;
   sdk: string;
-  keyFingerprint: string | null;
+  endpoint?: string | null;
   models: {
     text: string;
     json: string;
-    multimodal: string;
-    health: string;
+    scoring: string;
+    mediaReasoning: string;
   };
   generation: {
     temperature: number;
     creativeTemperature: number;
     topP: number;
     maxOutputTokens: number;
+    requestTimeoutSeconds?: number;
+  };
+  media?: {
+    imageOcr?: string;
+    audioTranscription?: string;
+    note?: string;
   };
   live?: {
     ok: boolean;
     message: string;
+    availableModels?: string[];
   };
 }
