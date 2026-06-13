@@ -17,19 +17,69 @@ _RETRY_SUFFIX = "\n\nYour previous response was not valid JSON. Output ONLY raw 
 _DEFAULT_CRITERIA = {
     "hr": ["clarity", "relevance", "fluency", "confidence"],
     "technical": ["accuracy", "depth", "practical_knowledge"],
-    "coding_logic": ["logic_correctness", "edge_cases", "complexity_awareness", "clarity"],
+    "coding_logic": [
+        "problem_understanding",
+        "algorithm_correctness",
+        "implementation_quality",
+        "edge_cases",
+        "complexity_awareness",
+        "code_clarity",
+    ],
     "behavioral": ["structure", "example_quality", "self_awareness", "impact"],
 }
 
+# Algorithm categories used to diversify generated coding questions
+_CODING_ALGORITHM_CATEGORIES = [
+    "array manipulation",
+    "string processing",
+    "hash map / frequency counting",
+    "two-pointer / sliding window",
+    "binary search",
+    "stack / queue",
+    "linked list",
+    "tree traversal (BFS / DFS)",
+    "graph traversal",
+    "dynamic programming",
+    "recursion / divide-and-conquer",
+    "sorting and searching",
+    "greedy algorithms",
+    "bit manipulation",
+]
 
-async def _call_ai_json(prompt: str):
+
+async def _call_ai_json(prompt: str, *, model_name: str | None = None, num_ctx: int | None = None):
+    """Call generate_json with optional model routing, retry on failure."""
     try:
-        return await generate_json(prompt, temperature=_settings.AI_CREATIVE_TEMPERATURE)
+        return await generate_json(
+            prompt,
+            temperature=_settings.AI_CREATIVE_TEMPERATURE,
+            model_name=model_name,
+            num_ctx=num_ctx,
+        )
     except Exception as first_error:
         logger.warning("Local AI admin generation failed, retrying once: %s", first_error)
         try:
-            return await generate_json(prompt + _RETRY_SUFFIX, temperature=_settings.AI_CREATIVE_TEMPERATURE)
+            return await generate_json(
+                prompt + _RETRY_SUFFIX,
+                temperature=_settings.AI_CREATIVE_TEMPERATURE,
+                model_name=model_name,
+                num_ctx=num_ctx,
+            )
         except Exception as second_error:
+            # If the coding model failed twice, fall back to the default model
+            if model_name and model_name != _settings.OLLAMA_MODEL:
+                logger.warning(
+                    "Coding model %r unavailable for question generation, falling back to %r: %s",
+                    model_name, _settings.OLLAMA_MODEL, second_error,
+                )
+                try:
+                    return await generate_json(
+                        prompt + _RETRY_SUFFIX,
+                        temperature=_settings.AI_CREATIVE_TEMPERATURE,
+                    )
+                except Exception as fallback_error:
+                    second_error = fallback_error
+
             logger.error("Local AI admin generation failed after retry: %s", second_error)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -57,6 +107,17 @@ def _build_question_prompt(
     )
     guidance_line = f"\nAdditional admin guidance: {guidance}\n" if guidance else ""
 
+    if phase == "coding_logic":
+        return _build_coding_question_prompt(
+            track=track,
+            topic_list=topic_list,
+            count=count,
+            difficulty=difficulty,
+            difficulty_line=difficulty_line,
+            guidance_line=guidance_line,
+            criteria=criteria,
+        )
+
     phase_instructions = {
         "hr": (
             "Generate HR voice-interview questions that assess communication, "
@@ -65,11 +126,6 @@ def _build_question_prompt(
         "technical": (
             "Generate conceptual technical short-answer questions. They should "
             "not require code, but they should reveal real understanding."
-        ),
-        "coding_logic": (
-            "Generate handwritten coding-logic prompts. Each prompt should ask "
-            "the candidate to solve or outline an algorithm on paper and upload "
-            "an image of their solution."
         ),
         "behavioral": (
             "Generate behavioral/culture-fit questions suitable for STAR-style "
@@ -109,6 +165,81 @@ def _build_question_prompt(
     )
 
 
+def _build_coding_question_prompt(
+    *,
+    track: dict,
+    topic_list: str,
+    count: int,
+    difficulty: str | None,
+    difficulty_line: str,
+    guidance_line: str,
+    criteria: list[str],
+) -> str:
+    """Coding-specific question generation prompt — optimised for qwen2.5-coder.
+
+    Produces questions that are:
+      • Self-contained (no external libraries required)
+      • Solvable on paper in 15–30 minutes at the stated difficulty
+      • Accompanied by a model_answer that includes Big-O analysis
+      • Tagged with the algorithm category for the admin portal filter
+    """
+    categories_sample = ", ".join(_CODING_ALGORITHM_CATEGORIES[:8])
+    return (
+        "You are a senior software engineer building a professional coding assessment "
+        "question bank for V-Prep, a mock interview platform.\n\n"
+
+        "═══ CONTEXT ═══\n"
+        f"Track: {track['name']}\n"
+        f"Description: {track.get('description', '')}\n"
+        f"Relevant topics: {topic_list}\n"
+        f"{difficulty_line}\n"
+        f"{guidance_line}\n"
+
+        "═══ QUESTION REQUIREMENTS ═══\n"
+        "Each coding question MUST:\n"
+        "1. Be solvable with pen-and-paper in 15–30 minutes at the stated difficulty.\n"
+        "2. Specify clear input/output format and at least one concrete example.\n"
+        "3. Avoid requiring external libraries — standard language constructs only.\n"
+        "4. Cover one primary algorithm category per question for variety.\n"
+        "5. Be appropriate for the track's domain (e.g. a web-dev track should prefer "
+        "   string/array problems over graph algorithms).\n\n"
+
+        "Difficulty guide:\n"
+        "  easy   — basic array/string manipulation, linear scan, O(n) solutions.\n"
+        "           Example: 'reverse a string', 'find max in array'.\n"
+        "  medium — two-pointer, sliding window, hash map, binary search, simple recursion.\n"
+        "           Example: 'two sum', 'valid parentheses', 'longest substring without repeats'.\n"
+        "  hard   — DP, graph BFS/DFS, divide and conquer, multiple nested optimisations.\n"
+        "           Example: 'LCS', 'word break', 'number of islands'.\n\n"
+
+        "Algorithm categories to rotate across questions:\n"
+        f"  {categories_sample}, etc.\n\n"
+
+        "═══ MODEL ANSWER FORMAT ═══\n"
+        "model_answer must contain (in order):\n"
+        "  1. Approach: one sentence describing the algorithm strategy.\n"
+        "  2. Code: clean Python or pseudocode solution (≤ 20 lines).\n"
+        "  3. Complexity: 'Time: O(...) | Space: O(...)'\n"
+        "  4. Edge cases: 2–3 bullet points of boundary conditions to check.\n\n"
+
+        "═══ OUTPUT ═══\n"
+        f"Generate exactly {count} distinct coding questions. "
+        "Use varied algorithm categories across the set.\n\n"
+        "Respond with a JSON object using this exact schema:\n"
+        "{\n"
+        '  "questions": [\n'
+        "    {\n"
+        '      "question_text": "Given an array of integers...",\n'
+        '      "difficulty": "medium",\n'
+        f'      "scoring_criteria": {criteria},\n'
+        '      "model_answer": "Approach: sliding window...\\nCode:\\n  def fn(...):\\n    ...\\nTime: O(n) | Space: O(k)\\nEdge cases:\\n  - empty array: return 0",\n'
+        '      "tags": ["array", "sliding-window", "medium"]\n'
+        "    }\n"
+        "  ]\n"
+        "}" + _JSON_ONLY_SUFFIX
+    )
+
+
 def _coerce_question_list(raw) -> list | None:
     """Normalize the local model's response into a list of question dicts.
 
@@ -136,8 +267,18 @@ async def generate_question_documents(
     difficulty: str | None,
     guidance: str | None,
 ) -> list[dict]:
+    # Use the code-specialised model for coding_logic questions —
+    # it produces significantly better algorithm variety, Big-O annotations,
+    # and more realistic hand-solvable problem statements.
+    coding_model = (_settings.OLLAMA_CODING_MODEL or "").strip() or None
+    is_coding = phase == "coding_logic"
+    model_name = coding_model if is_coding else None
+    num_ctx    = _settings.OLLAMA_CODING_NUM_CTX if is_coding and coding_model else None
+    if is_coding and coding_model:
+        logger.info("Generating coding questions with model %r", coding_model)
+
     prompt = _build_question_prompt(track, phase, count, difficulty, guidance)
-    raw = await _call_ai_json(prompt)
+    raw = await _call_ai_json(prompt, model_name=model_name, num_ctx=num_ctx)
     raw_questions = _coerce_question_list(raw)
     if raw_questions is None:
         raise HTTPException(

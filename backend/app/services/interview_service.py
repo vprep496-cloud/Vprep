@@ -767,12 +767,24 @@ async def submit_coding_answer_async(
     }
 
 
+_CODING_RETRY_DELAYS = (0, 8, 30)   # seconds before each attempt (0 = immediate)
+_CODING_SCORE_TIMEOUT = 240         # per-attempt timeout — coding model is larger
+
+
 async def _score_coding_answer_background(
     session_id: str,
     question_id: str,
     db: AsyncIOMotorDatabase,
 ) -> None:
-    """Background task: retrieve stored image, run OCR+AI scoring, patch the answer doc."""
+    """Background task: retrieve stored image, run OCR + qwen2.5-coder scoring.
+
+    Retry strategy (mirrors voice retry):
+      Attempt 1 — immediate                     (qwen2.5-coder primary)
+      Attempt 2 — 8 s delay                     (falls back to default model inside
+      Attempt 3 — 30 s delay                     score_interview_image if primary fails)
+    All retry decisions live in score_interview_image / _call_multimodal_json_with_retry
+    so this loop only handles transient infrastructure errors at the service level.
+    """
     from bson import ObjectId
     from bson.errors import InvalidId
     from app.services.notification_service import send_coding_result_notification
@@ -791,66 +803,136 @@ async def _score_coding_answer_background(
         {"$set": {"answers.$.coding_score_status": "processing"}},
     )
 
+    # ── Load the answer + question once (image is stored as base64) ───────────
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        return
+
+    answer = next((a for a in session.get("answers", []) if a["question_id"] == question_id), None)
+    if answer is None:
+        return
+
+    image_base64 = answer.get("_coding_image_base64")
+    image_mime_type = answer.get("_coding_image_mime_type", "image/jpeg")
+
+    if not image_base64:
+        logger.error("Background coding: no image data stored. session_id=%s", session_id)
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.coding_score_status": "failed",
+                "answers.$.feedback": "No image data was stored. Please re-submit your solution.",
+                "answers.$.manual_review_status": "pending",
+            }},
+        )
+        return
+
+    phase_questions = session.get("questions_by_phase", {}).get("coding_logic", [])
+    question = next((q for q in phase_questions if q["id"] == question_id), None)
+    if question is None:
+        logger.error("Background coding: question not found. session_id=%s question_id=%s", session_id, question_id)
+        return
+
+    # ── Retry loop with exponential backoff ───────────────────────────────────
+    last_exc: Exception | None = None
+    scored: dict | None = None
+
+    for attempt, delay in enumerate(_CODING_RETRY_DELAYS, start=1):
+        if delay > 0:
+            logger.info(
+                "Background coding: waiting %ds before attempt %d/%d. session_id=%s",
+                delay, attempt, len(_CODING_RETRY_DELAYS), session_id,
+            )
+            await asyncio.sleep(delay)
+        try:
+            scored = await asyncio.wait_for(
+                score_image_answer(question, image_base64, image_mime_type),
+                timeout=_CODING_SCORE_TIMEOUT,
+            )
+            logger.info(
+                "Background coding: attempt %d succeeded. session_id=%s score=%s",
+                attempt, session_id, scored.get("overall_score"),
+            )
+            last_exc = None
+            break
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            logger.warning(
+                "Background coding: attempt %d timed out after %ds. session_id=%s",
+                attempt, _CODING_SCORE_TIMEOUT, session_id,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Background coding: attempt %d failed (%s). session_id=%s",
+                attempt, exc, session_id,
+            )
+
+    # ── All attempts exhausted — persist failure ──────────────────────────────
+    if scored is None:
+        logger.error(
+            "Background coding score failed after %d attempts. session_id=%s question_id=%s error=%s",
+            len(_CODING_RETRY_DELAYS), session_id, question_id, last_exc,
+        )
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.coding_score_status": "failed",
+                "answers.$.feedback": (
+                    "Automatic scoring is temporarily unavailable. "
+                    "Your submission has been saved and our team will review it manually."
+                ),
+                "answers.$.manual_review_status": "pending",
+            }},
+        )
+        return
+
+    # ── Persist successful result ─────────────────────────────────────────────
     try:
-        session = await db["sessions"].find_one({"_id": object_id})
-        if session is None:
-            return
-
-        answer = next((a for a in session.get("answers", []) if a["question_id"] == question_id), None)
-        if answer is None:
-            return
-
-        image_base64 = answer.get("_coding_image_base64")
-        image_mime_type = answer.get("_coding_image_mime_type", "image/jpeg")
-
-        if not image_base64:
-            raise ValueError("No image data stored for background scoring.")
-
-        phase_questions = session.get("questions_by_phase", {}).get("coding_logic", [])
-        question = next((q for q in phase_questions if q["id"] == question_id), None)
-        if question is None:
-            raise ValueError("Question not found in session.")
-
-        scored = await score_image_answer(question, image_base64, image_mime_type)
-
         review_flags = sorted(set(list(scored.get("review_flags", [])) + answer.get("review_flags", [])))
         scoring_metadata = dict(scored.get("scoring_metadata") or {})
         scoring_metadata["review_flags"] = review_flags
         final_score = max(0, min(int(scored.get("overall_score", 0)), 100))
 
+        update_fields: dict[str, Any] = {
+            "answers.$.score": final_score,
+            "answers.$.criteria_scores": scored.get("criteria_scores", {}),
+            "answers.$.feedback": scored.get("feedback", ""),
+            "answers.$.transcription": scored.get("transcription"),
+            "answers.$.model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+            "answers.$.confidence": scored.get("confidence"),
+            "answers.$.strengths": scored.get("strengths", []),
+            "answers.$.improvements": scored.get("improvements", []),
+            "answers.$.review_flags": review_flags,
+            "answers.$.evidence": scored.get("evidence", []),
+            "answers.$.score_rationale": scored.get("score_rationale"),
+            "answers.$.rubric_version": scored.get("rubric_version"),
+            "answers.$.scoring_mode": scored.get("scoring_mode"),
+            "answers.$.scoring_metadata": scoring_metadata,
+            "answers.$.ai_score": final_score,
+            "answers.$.ai_criteria_scores": scored.get("criteria_scores", {}),
+            "answers.$.ai_feedback": scored.get("feedback", ""),
+            "answers.$.ai_confidence": scored.get("confidence"),
+            "answers.$.ai_review_flags": review_flags,
+            "answers.$.ai_scoring_metadata": scoring_metadata,
+            "answers.$.manual_review_status": "pending" if "manual_review_recommended" in review_flags else "not_required",
+            "answers.$.coding_score_status": "complete",
+            # Clean up stored image bytes (no longer needed after scoring)
+            "answers.$._coding_image_base64": None,
+        }
+        # Persist code_analysis (algorithm category, Big-O, optimality)
+        if scored.get("code_analysis"):
+            update_fields["answers.$.code_analysis"] = scored["code_analysis"]
+
         await db["sessions"].update_one(
             {"_id": object_id, "answers.question_id": question_id},
-            {"$set": {
-                "answers.$.score": final_score,
-                "answers.$.criteria_scores": scored.get("criteria_scores", {}),
-                "answers.$.feedback": scored.get("feedback", ""),
-                "answers.$.transcription": scored.get("transcription"),
-                "answers.$.model_answer": scored.get("model_answer") or question.get("model_answer", ""),
-                "answers.$.confidence": scored.get("confidence"),
-                "answers.$.strengths": scored.get("strengths", []),
-                "answers.$.improvements": scored.get("improvements", []),
-                "answers.$.review_flags": review_flags,
-                "answers.$.evidence": scored.get("evidence", []),
-                "answers.$.score_rationale": scored.get("score_rationale"),
-                "answers.$.rubric_version": scored.get("rubric_version"),
-                "answers.$.scoring_mode": scored.get("scoring_mode"),
-                "answers.$.scoring_metadata": scoring_metadata,
-                "answers.$.ai_score": final_score,
-                "answers.$.ai_criteria_scores": scored.get("criteria_scores", {}),
-                "answers.$.ai_feedback": scored.get("feedback", ""),
-                "answers.$.ai_confidence": scored.get("confidence"),
-                "answers.$.ai_review_flags": review_flags,
-                "answers.$.ai_scoring_metadata": scoring_metadata,
-                "answers.$.manual_review_status": "pending" if "manual_review_recommended" in review_flags else "not_required",
-                "answers.$.coding_score_status": "complete",
-                # Clean up stored image bytes (no longer needed)
-                "answers.$._coding_image_base64": None,
-            }},
+            {"$set": update_fields},
         )
 
         logger.info(
-            "Background coding score complete. session_id=%s question_id=%s score=%d",
+            "Background coding score complete. session_id=%s question_id=%s score=%d model=%s",
             session_id, question_id, final_score,
+            (scoring_metadata.get("provider") or "unknown"),
         )
 
         # Send push notification to user
@@ -859,10 +941,10 @@ async def _score_coding_answer_background(
         except Exception as notify_exc:
             logger.warning("Coding result notification failed: %s", notify_exc)
 
-    except Exception as exc:
+    except Exception as persist_exc:
         logger.error(
-            "Background coding score failed. session_id=%s question_id=%s error=%s",
-            session_id, question_id, exc,
+            "Background coding: failed to persist result. session_id=%s error=%s",
+            session_id, persist_exc,
         )
         await db["sessions"].update_one(
             {"_id": object_id, "answers.question_id": question_id},
@@ -1243,18 +1325,62 @@ def _sanitize_phase_results(phase_results: list[dict]) -> list[dict]:
     return sanitized
 
 
+def _merge_live_answers(phase_results: list[dict], live_answers: list[dict]) -> list[dict]:
+    """Merge the latest live answer data from the session's answers array into
+    the stored phase_results.
+
+    Context: background scoring jobs (voice + coding) update `answers.$.xxx`
+    positionally via MongoDB's `$` operator after `complete_session()` has
+    already computed and stored `phase_results`. This means `phase_results` can
+    hold stale data (score=0, no code_analysis) for any answer that was still
+    pending when the session was completed. To avoid showing the user stale
+    results we re-merge the current answers array here.
+
+    Only non-None values from live_answers overwrite the phase_results copy so
+    that fields genuinely absent from the live document are not silently cleared.
+    Private binary fields are still stripped via _PRIVATE_ANSWER_FIELDS.
+    """
+    if not live_answers:
+        return _sanitize_phase_results(phase_results)
+
+    live_by_id = {a["question_id"]: a for a in live_answers}
+    merged = []
+    for phase in phase_results:
+        updated_answers = []
+        for stored_answer in phase.get("answers", []):
+            qid = stored_answer.get("question_id")
+            live = live_by_id.get(qid)
+            if live is not None:
+                # Build the merged dict: start from the stored answer, overlay
+                # every non-None value from the live answer, then strip private fields.
+                merged_answer = {
+                    **stored_answer,
+                    **{k: v for k, v in live.items() if v is not None and k not in _PRIVATE_ANSWER_FIELDS},
+                }
+                merged_answer = {k: v for k, v in merged_answer.items() if k not in _PRIVATE_ANSWER_FIELDS}
+            else:
+                merged_answer = {k: v for k, v in stored_answer.items() if k not in _PRIVATE_ANSWER_FIELDS}
+            updated_answers.append(merged_answer)
+        merged.append({**phase, "answers": updated_answers})
+    return merged
+
+
 def to_session_result(session: dict) -> dict:
     """Project a completed session document down to the SessionResult shape
     (also reused by GET /session/{id}, GET /history, and all admin routes).
-    Always strips private binary fields from phase_results answers so large
-    base64 blobs never appear in API responses."""
+
+    Merges live answer data from the session's answers array back into the
+    stored phase_results so that background-scored answers (voice/coding) always
+    show their final score, code_analysis, star_analysis, etc. rather than the
+    placeholder values stored at complete_session() time."""
+    live_answers: list[dict] = session.get("answers", [])
     return {
         "id": session["id"],
         "user_id": session["user_id"],
         "track_id": session["track_id"],
         "mode": session["mode"],
         "overall_score": session["overall_score"],
-        "phase_results": _sanitize_phase_results(session.get("phase_results", [])),
+        "phase_results": _merge_live_answers(session.get("phase_results", []), live_answers),
         "started_at": session["started_at"],
         "completed_at": session["completed_at"],
         "duration_seconds": session["duration_seconds"],
@@ -1314,17 +1440,6 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
 
     phase_results: list[dict] = []
     phase_scores: dict[str, int] = {}
-
-    # Private storage-only fields that must never appear in phase_results (or
-    # any API response).  They can be large base64 blobs (1-5 MB each) and will
-    # push the MongoDB document well past its 16 MB hard limit when there are
-    # multiple pending voice/coding answers at completion time.
-    _PRIVATE_ANSWER_FIELDS = frozenset({
-        "_voice_audio_base64",
-        "_voice_audio_format",
-        "_coding_image_base64",
-        "_coding_image_mime_type",
-    })
 
     def _clean_answer(ans: dict) -> dict:
         """Return a shallow copy of ans with all private storage fields removed."""

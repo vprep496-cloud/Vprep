@@ -134,6 +134,11 @@ async def submit_answer(
         else "not_required"
     )
 
+    # STAR analysis — present only for behavioral voice answers when LLM scoring produced it.
+    star_analysis: dict | None = scored.get("star_analysis") if payload.answer_type == "voice" else None
+    # Code analysis — present only for coding image answers scored by qwen2.5-coder.
+    code_analysis: dict | None = scored.get("code_analysis") if payload.answer_type == "image" else None
+
     answer_doc = {
         "question_id": payload.question_id,
         "question_text": question["question_text"],
@@ -160,6 +165,8 @@ async def submit_answer(
         "rubric_version": scored.get("rubric_version"),
         "scoring_mode": scored.get("scoring_mode"),
         "scoring_metadata": scoring_metadata,
+        "star_analysis": star_analysis,
+        "code_analysis": code_analysis,
         "ai_score": max(0, min(int(scored.get("overall_score", 0)), 100)),
         "ai_criteria_scores": scored.get("criteria_scores", {}),
         "ai_feedback": scored.get("feedback", ""),
@@ -189,6 +196,9 @@ async def submit_answer(
         "score_rationale": answer_doc["score_rationale"],
         "rubric_version": answer_doc["rubric_version"],
         "scoring_mode": answer_doc["scoring_mode"],
+        "scoring_metadata": scoring_metadata,
+        "star_analysis": star_analysis,
+        "code_analysis": code_analysis,
     }
 
 
