@@ -4,7 +4,7 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
-import { ChevronRight, Search } from "lucide-react";
+import { ChevronRight, Search, UserCog } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import DataTable, { type DataTableColumn } from "@/components/ui/DataTable";
@@ -25,11 +25,6 @@ const ROLE_TABS: { value: RoleFilter; label: string }[] = [
 
 const PAGE_SIZE = 20;
 
-// `PromoteUserModal` expects `AdminUser` (it needs `backendUserId` to post to
-// `/auth/promote`). `CandidateListItem.id` IS that backend user id — it's
-// `_serialize(user)["id"]` straight off `admin.py`'s `/candidates` route — so
-// this is a structural widen, not a remapping (mirrors `toAdminUser` in
-// `users/page.tsx`, just starting from a richer source shape).
 function toAdminUser(candidate: CandidateListItem): AdminUser {
   return {
     id: candidate.id,
@@ -42,12 +37,6 @@ function toAdminUser(candidate: CandidateListItem): AdminUser {
   };
 }
 
-// Phase 6 — searchable/filterable candidate directory. Built on
-// `adminApi.getCandidates` (`GET /admin/candidates`), which — unlike
-// `/admin/users` (Phase 2's role-management list) — enriches each row with
-// interview-specific stats (`enrollmentCount`/`sessionCount`/`averageScore`)
-// and supports a `track_id` filter, so this page can do double duty as both
-// "find a candidate" and "see who's engaging with track X."
 export default function CandidatesPage() {
   const { data: session } = useSession();
   const queryClient = useQueryClient();
@@ -59,7 +48,7 @@ export default function CandidatesPage() {
   const [trackFilter, setTrackFilter] = useState<string>("all");
   const [promotingCandidate, setPromotingCandidate] = useState<CandidateListItem | null>(null);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["admin-candidates", { page, search, roleFilter, trackFilter }],
     queryFn: () =>
       adminApi.getCandidates({
@@ -69,33 +58,42 @@ export default function CandidatesPage() {
         role: roleFilter !== "all" ? roleFilter : undefined,
         trackId: trackFilter !== "all" ? trackFilter : undefined,
       }),
+    retry: 1,
   });
+
   const { data: tracks } = useQuery({
     queryKey: ["admin-tracks"],
     queryFn: adminApi.getTracks,
+    retry: 1,
   });
 
   const candidates = useMemo(() => data?.items ?? [], [data]);
   const total = data?.total ?? 0;
   const pages = data?.pages ?? 1;
 
+  const hasFilters = search !== "" || roleFilter !== "all" || trackFilter !== "all";
+
+  const clearFilters = () => {
+    setSearch(""); setRoleFilter("all"); setTrackFilter("all"); setPage(1);
+  };
+
   const columns: DataTableColumn<CandidateListItem>[] = [
     {
       key: "name",
       label: "Candidate",
-      render: (candidate) => (
-        <Link href={`/candidates/${candidate.id}`} className="group flex items-center gap-3">
-          {candidate.image ? (
-            // eslint-disable-next-line @next/next/no-img-element -- external Google avatar URL
-            <img src={candidate.image} alt={candidate.name} className="h-8 w-8 rounded-full" />
+      render: (c) => (
+        <Link href={`/candidates/${c.id}`} className="group flex items-center gap-3">
+          {c.image ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={c.image} alt={c.name} className="h-8 w-8 rounded-full ring-1 ring-border" />
           ) : (
-            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-background-surface text-xs font-semibold text-text-primary">
-              {candidate.name.charAt(0).toUpperCase()}
+            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-primary-500/10 text-xs font-bold text-primary-600">
+              {(c.name || "?").charAt(0).toUpperCase()}
             </div>
           )}
           <div>
-            <p className="font-medium text-text-primary group-hover:underline">{candidate.name}</p>
-            <p className="text-xs text-text-muted">{candidate.email}</p>
+            <p className="font-semibold text-text-primary group-hover:text-primary-600 transition-colors">{c.name}</p>
+            <p className="text-xs text-text-muted">{c.email}</p>
           </div>
         </Link>
       ),
@@ -103,28 +101,36 @@ export default function CandidatesPage() {
     {
       key: "role",
       label: "Role",
-      render: (candidate) => <RoleBadge role={candidate.role} />,
+      render: (c) => <RoleBadge role={c.role} />,
     },
     {
       key: "enrollmentCount",
-      label: "Enrollments",
-      render: (candidate) => <span className="text-text-secondary">{candidate.enrollmentCount}</span>,
+      label: "Tracks",
+      render: (c) => (
+        <span className="inline-flex items-center rounded-full bg-background-surface px-2.5 py-0.5 text-xs font-semibold text-text-secondary">
+          {c.enrollmentCount}
+        </span>
+      ),
     },
     {
       key: "sessionCount",
       label: "Sessions",
-      render: (candidate) => <span className="text-text-secondary">{candidate.sessionCount}</span>,
+      render: (c) => (
+        <span className="inline-flex items-center rounded-full bg-background-surface px-2.5 py-0.5 text-xs font-semibold text-text-secondary">
+          {c.sessionCount}
+        </span>
+      ),
     },
     {
       key: "averageScore",
       label: "Avg Score",
-      render: (candidate) => <ScoreBadge score={candidate.averageScore} />,
+      render: (c) => <ScoreBadge score={c.averageScore} />,
     },
     {
       key: "createdAt",
       label: "Joined",
-      render: (candidate) =>
-        new Date(candidate.createdAt).toLocaleDateString(undefined, {
+      render: (c) =>
+        new Date(c.createdAt).toLocaleDateString(undefined, {
           year: "numeric",
           month: "short",
           day: "numeric",
@@ -132,32 +138,24 @@ export default function CandidatesPage() {
     },
     {
       key: "actions",
-      label: "Actions",
-      render: (candidate) => {
-        const isSelf = candidate.id === session?.user?.backendUserId;
+      label: "",
+      render: (c) => {
+        const isSelf = c.id === session?.user?.backendUserId;
         return (
           <div className="flex items-center gap-2">
             <Link
-              href={`/candidates/${candidate.id}`}
-              className="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:bg-background-surface hover:text-text-primary"
+              href={`/candidates/${c.id}`}
+              className="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:border-primary-300 hover:bg-primary-500/5 hover:text-primary-600"
             >
-              View <ChevronRight size={13} />
+              View <ChevronRight size={12} />
             </Link>
-            {/* Agent Rule #7: promotion is a superadmin-only action — backend
-                enforces it via `require_role("superadmin")` on `/auth/promote`,
-                so a plain admin clicking this would only ever see a 403. HIDE
-                it for them rather than show-then-fail (a deliberate
-                improvement over `users/page.tsx`'s Phase-2 button, which this
-                phase isn't permitted to modify — see that file's Actions
-                column for the un-gated precedent this page intentionally
-                departs from). */}
-            {isSuperadmin && candidate.role !== "superadmin" && !isSelf ? (
+            {isSuperadmin && c.role !== "superadmin" && !isSelf ? (
               <button
                 type="button"
-                onClick={() => setPromotingCandidate(candidate)}
-                className="rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:bg-background-surface hover:text-text-primary"
+                onClick={() => setPromotingCandidate(c)}
+                className="inline-flex items-center gap-1 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-text-secondary transition-colors hover:border-primary-300 hover:bg-primary-500/5 hover:text-primary-600"
               >
-                Promote
+                <UserCog size={12} /> Role
               </button>
             ) : null}
           </div>
@@ -167,41 +165,37 @@ export default function CandidatesPage() {
   ];
 
   return (
-    <div>
+    <div className="space-y-6">
       <PageHeader
         title="Candidates"
-        badge={`${total} total`}
+        badge={total ? `${total} total` : undefined}
         description="Search, filter, and drill into every candidate's interview activity."
       />
 
-      <div className="mt-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-        <div className="relative w-full lg:max-w-xs">
-          <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
+      <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+        {/* Search */}
+        <div className="relative w-full lg:max-w-sm">
+          <Search size={15} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-muted" />
           <input
             type="text"
             value={search}
-            onChange={(event) => {
-              setSearch(event.target.value);
-              setPage(1);
-            }}
-            placeholder="Search by name or email"
-            className="w-full rounded-xl border border-border bg-background-card py-2.5 pl-10 pr-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary-500"
+            onChange={(e) => { setSearch(e.target.value); setPage(1); }}
+            placeholder="Search by name or email…"
+            className="w-full rounded-xl border border-border bg-background-card py-2.5 pl-9 pr-3 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary-500/50"
           />
         </div>
 
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
-          <div className="flex gap-1.5 rounded-xl border border-border bg-background-card p-1">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* Role tabs */}
+          <div className="flex gap-1 rounded-xl border border-border bg-background-surface p-1">
             {ROLE_TABS.map((tab) => (
               <button
                 key={tab.value}
                 type="button"
-                onClick={() => {
-                  setRoleFilter(tab.value);
-                  setPage(1);
-                }}
-                className={`rounded-lg px-3 py-1.5 text-sm font-medium transition-colors ${
+                onClick={() => { setRoleFilter(tab.value); setPage(1); }}
+                className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition-colors ${
                   roleFilter === tab.value
-                    ? "bg-primary-500 text-white"
+                    ? "bg-primary-500 text-white shadow-sm"
                     : "text-text-secondary hover:text-text-primary"
                 }`}
               >
@@ -210,85 +204,77 @@ export default function CandidatesPage() {
             ))}
           </div>
 
+          {/* Track filter */}
           <select
             value={trackFilter}
-            onChange={(event) => {
-              setTrackFilter(event.target.value);
-              setPage(1);
-            }}
-            className="rounded-xl border border-border bg-background-card px-3 py-2.5 text-sm text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500"
+            onChange={(e) => { setTrackFilter(e.target.value); setPage(1); }}
+            className="rounded-xl border border-border bg-background-card px-3 py-2.5 text-xs text-text-primary focus:outline-none focus:ring-2 focus:ring-primary-500/50"
           >
             <option value="all">All tracks</option>
-            {(tracks ?? []).map((track) => (
-              <option key={track.id} value={track.id}>
-                {track.name}
-              </option>
+            {(tracks ?? []).map((t) => (
+              <option key={t.id} value={t.id}>{t.name}</option>
             ))}
           </select>
         </div>
       </div>
 
-      <div className="mt-6">
-        <DataTable
-          columns={columns}
-          data={candidates}
-          loading={isLoading}
-          emptyMessage={
-            // Phase 7 spec: "empty search state shows 'No candidates match your
-            // search' with a clear filters button."
-            search || roleFilter !== "all" || trackFilter !== "all" ? (
-              <span className="flex flex-col items-center gap-3">
-                <span className="text-text-muted">No candidates match your search.</span>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSearch("");
-                    setRoleFilter("all");
-                    setTrackFilter("all");
-                    setPage(1);
-                  }}
-                  className="rounded-lg border border-border px-4 py-2 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface hover:text-text-primary"
-                >
-                  Clear filters
-                </button>
-              </span>
-            ) : (
-              "No candidates yet."
-            )
-          }
-        />
-      </div>
+      <DataTable
+        columns={columns}
+        data={candidates}
+        loading={isLoading}
+        error={isError}
+        onRetry={() => refetch()}
+        emptyMessage={
+          hasFilters ? (
+            <span className="flex flex-col items-center gap-3">
+              <span className="text-text-muted">No candidates match your search.</span>
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="rounded-lg border border-border px-4 py-2 text-xs font-semibold text-text-secondary transition-colors hover:bg-background-surface"
+              >
+                Clear filters
+              </button>
+            </span>
+          ) : (
+            "No candidates yet."
+          )
+        }
+      />
 
-      <div className="mt-4 flex items-center justify-between text-sm text-text-secondary">
-        <span>
-          Page {data?.page ?? page} of {pages}
-        </span>
-        <div className="flex gap-2">
-          <button
-            type="button"
-            onClick={() => setPage((current) => Math.max(current - 1, 1))}
-            disabled={page <= 1}
-            className="rounded-lg border border-border px-3 py-1.5 font-medium transition-colors hover:bg-background-surface disabled:opacity-40"
-          >
-            Previous
-          </button>
-          <button
-            type="button"
-            onClick={() => setPage((current) => Math.min(current + 1, pages))}
-            disabled={page >= pages}
-            className="rounded-lg border border-border px-3 py-1.5 font-medium transition-colors hover:bg-background-surface disabled:opacity-40"
-          >
-            Next
-          </button>
+      {!isLoading && !isError && (
+        <div className="flex items-center justify-between text-xs text-text-muted">
+          <span>Page {data?.page ?? page} of {pages} · {total} candidates</span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setPage((c) => Math.max(c - 1, 1))}
+              disabled={page <= 1}
+              className="rounded-lg border border-border px-3 py-1.5 font-medium transition-colors hover:bg-background-surface disabled:opacity-40"
+            >
+              ← Previous
+            </button>
+            <button
+              type="button"
+              onClick={() => setPage((c) => Math.min(c + 1, pages))}
+              disabled={page >= pages}
+              className="rounded-lg border border-border px-3 py-1.5 font-medium transition-colors hover:bg-background-surface disabled:opacity-40"
+            >
+              Next →
+            </button>
+          </div>
         </div>
-      </div>
+      )}
 
       {promotingCandidate ? (
         <PromoteUserModal
           user={toAdminUser(promotingCandidate)}
           isOpen={!!promotingCandidate}
           onClose={() => setPromotingCandidate(null)}
-          onSuccess={() => queryClient.invalidateQueries({ queryKey: ["admin-candidates"] })}
+          onSuccess={() => {
+            queryClient.invalidateQueries({ queryKey: ["admin-candidates"] });
+            setPromotingCandidate(null);
+          }}
         />
       ) : null}
     </div>

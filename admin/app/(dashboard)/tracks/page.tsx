@@ -4,12 +4,113 @@ import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
 import axios from "axios";
-import { Loader2, Plus, Trash2 } from "lucide-react";
+import { Loader2, Plus, Trash2, X } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import PageHeader from "@/components/ui/PageHeader";
 import DataTable, { type DataTableColumn } from "@/components/ui/DataTable";
 import type { TrackInput, TrackSummary } from "@/types";
+
+// ---------------------------------------------------------------------------
+// Confirmation dialog — shown before deactivating a track so an accidental
+// click can't silently delete it. Uses the same header/body/footer modal
+// pattern as AddQuestionModal / PromoteUserModal.
+// ---------------------------------------------------------------------------
+function DeleteTrackDialog({
+  track,
+  onClose,
+  onDeleted,
+}: {
+  track: TrackSummary;
+  onClose: () => void;
+  onDeleted: () => void;
+}) {
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleConfirm = async () => {
+    setIsSubmitting(true);
+    setError(null);
+    try {
+      await adminApi.deleteTrack(track.id);
+      onDeleted();
+      onClose();
+    } catch (err) {
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : null;
+      setError(typeof detail === "string" ? detail : "Could not deactivate this track. Please try again.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+      <div className="w-full max-w-md rounded-2xl border border-border bg-background-card shadow-xl">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-5">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-danger/10">
+              <Trash2 size={16} className="text-danger" />
+            </div>
+            <div>
+              <h2 className="text-base font-bold text-text-primary">Deactivate Track</h2>
+              <p className="text-xs text-text-muted line-clamp-1">{track.name}</p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isSubmitting}
+            className="rounded-lg p-1.5 text-text-muted transition-colors hover:bg-background-surface hover:text-text-primary disabled:opacity-50"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-5">
+          <p className="text-sm text-text-secondary">
+            This will permanently deactivate{" "}
+            <span className="font-semibold text-text-primary">{track.name}</span>. Existing
+            enrollments are preserved but no new enrollments can reference this track.
+          </p>
+          <div className="mt-4 flex items-start gap-2.5 rounded-xl border border-danger/25 bg-danger/5 px-4 py-3">
+            <div className="mt-0.5 h-2 w-2 shrink-0 rounded-full bg-danger" />
+            <p className="text-sm text-danger">This action cannot be undone.</p>
+          </div>
+          {error ? (
+            <div className="mt-3 flex items-center gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
+              <div className="h-2 w-2 shrink-0 rounded-full bg-danger" />
+              <p className="text-sm text-danger">{error}</p>
+            </div>
+          ) : null}
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isSubmitting}
+            className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleConfirm}
+            disabled={isSubmitting}
+            className="flex items-center gap-2 rounded-xl bg-danger px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-danger/90 disabled:opacity-50"
+          >
+            {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+            Deactivate
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 const FIELD_CLASS =
   "w-full rounded-xl border border-border bg-background-surface px-3 py-2.5 text-sm text-text-primary placeholder:text-text-muted focus:outline-none focus:ring-2 focus:ring-primary-500";
@@ -37,10 +138,12 @@ export default function TracksPage() {
   });
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [deletingTrack, setDeletingTrack] = useState<TrackSummary | null>(null);
 
-  const { data: tracks, isLoading } = useQuery({
+  const { data: tracks, isLoading, isError, refetch } = useQuery({
     queryKey: ["admin-tracks"],
     queryFn: adminApi.getTracks,
+    retry: 1,
   });
 
   const sortedTracks = useMemo(() => tracks ?? [], [tracks]);
@@ -82,10 +185,9 @@ export default function TracksPage() {
     }
   };
 
-  const handleDeactivate = async (trackId: string) => {
-    if (!isSuperadmin) return;
-    await adminApi.deleteTrack(trackId);
+  const handleDeactivateConfirmed = () => {
     queryClient.invalidateQueries({ queryKey: ["admin-tracks"] });
+    setDeletingTrack(null);
   };
 
   const columns: DataTableColumn<TrackSummary>[] = [
@@ -117,7 +219,7 @@ export default function TracksPage() {
       label: "Topic Areas",
       render: (track) => (
         <div className="flex max-w-sm flex-wrap gap-1.5">
-          {track.topicAreas.slice(0, 5).map((topic) => (
+          {(track.topicAreas ?? []).slice(0, 5).map((topic) => (
             <span key={topic} className="rounded-full bg-background-surface px-2 py-0.5 text-xs text-text-muted">
               {topic}
             </span>
@@ -132,7 +234,7 @@ export default function TracksPage() {
         isSuperadmin ? (
           <button
             type="button"
-            onClick={() => handleDeactivate(track.id)}
+            onClick={() => setDeletingTrack(track)}
             className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs font-medium text-danger transition-colors hover:bg-danger/10"
           >
             <Trash2 size={13} />
@@ -215,8 +317,16 @@ export default function TracksPage() {
       ) : null}
 
       <div className="mt-6">
-        <DataTable columns={columns} data={sortedTracks} loading={isLoading} emptyMessage="No active tracks found" />
+        <DataTable columns={columns} data={sortedTracks} loading={isLoading} error={isError} onRetry={() => refetch()} emptyMessage="No active tracks found" />
       </div>
+
+      {deletingTrack ? (
+        <DeleteTrackDialog
+          track={deletingTrack}
+          onClose={() => setDeletingTrack(null)}
+          onDeleted={handleDeactivateConfirmed}
+        />
+      ) : null}
     </div>
   );
 }

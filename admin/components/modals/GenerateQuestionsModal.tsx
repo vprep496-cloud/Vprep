@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import axios from "axios";
-import { Loader2, Sparkles } from "lucide-react";
+import { Loader2, Sparkles, X } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import { DIFFICULTY_OPTIONS, PHASE_OPTIONS, type TrackOption } from "@/lib/tracks";
@@ -78,20 +78,37 @@ export default function GenerateQuestionsModal({
     }
   };
 
-  return (
-    <div style={{ minHeight: 500 }}>
-      {isOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/50 backdrop-blur-sm p-4">
-          <div className="w-full max-w-xl rounded-2xl border border-border bg-background-card p-6 shadow-xl">
-            <div className="flex items-center gap-2">
-              <Sparkles size={18} className="text-primary-400" />
-              <h2 className="text-lg font-bold text-text-primary">Generate Questions</h2>
-            </div>
-            <p className="mt-1 text-sm text-text-secondary">
-              Create a local AI-generated batch and save it directly to the question bank.
-            </p>
+  if (!isOpen) return null;
 
-            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+  return (
+    <>
+      <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 backdrop-blur-sm p-4">
+        <div className="w-full max-w-xl rounded-2xl border border-border bg-background-card shadow-xl">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary-500/10">
+                <Sparkles size={16} className="text-primary-600" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-text-primary">Generate Questions</h2>
+                <p className="text-xs text-text-muted">AI-generate a batch and add to the question bank</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={isSubmitting}
+              className="rounded-lg p-1.5 text-text-muted transition-colors hover:bg-background-surface hover:text-text-primary disabled:opacity-50"
+              aria-label="Close"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          {/* Body */}
+          <div className="px-6 py-5">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <label className={LABEL_CLASS}>
                 Track
                 <select
@@ -169,30 +186,46 @@ export default function GenerateQuestionsModal({
               />
             </label>
 
-            {error ? <p className="mt-4 text-sm text-danger">{error}</p> : null}
+            {/* Warning when about to run LLM */}
+            {isSubmitting ? (
+              <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-primary-500/20 bg-primary-500/5 px-4 py-3">
+                <Loader2 size={14} className="shrink-0 animate-spin text-primary-500" />
+                <p className="text-sm text-primary-600">
+                  Generating questions with local AI — this may take a moment…
+                </p>
+              </div>
+            ) : null}
 
-            <div className="mt-6 flex justify-end gap-3">
-              <button
-                type="button"
-                onClick={handleClose}
-                disabled={isSubmitting}
-                className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSubmit}
-                disabled={isSubmitting || !isValid}
-                className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
-              >
-                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
-                Generate
-              </button>
-            </div>
+            {error ? (
+              <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
+                <div className="h-2 w-2 shrink-0 rounded-full bg-danger" />
+                <p className="text-sm text-danger">{error}</p>
+              </div>
+            ) : null}
+          </div>
+
+          {/* Footer */}
+          <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={isSubmitting}
+              className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={isSubmitting || !isValid}
+              className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
+            >
+              {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+              Generate
+            </button>
           </div>
         </div>
-      ) : null}
-    </div>
+      </div>
+    </>
   );
 }

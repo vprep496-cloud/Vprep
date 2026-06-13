@@ -173,7 +173,24 @@ def _phase_weights(present_phases: list[str]) -> dict[str, float]:
     return {phase: base[phase] + bonus for phase in present_phases}
 
 
+_PRIVATE_ANSWER_FIELDS: frozenset[str] = frozenset({
+    "_voice_audio_base64",
+    "_voice_audio_format",
+    "_coding_image_base64",
+    "_coding_image_mime_type",
+})
+
+
+def _clean_answer(answer: dict) -> dict:
+    """Return a shallow copy of answer with all private storage fields removed."""
+    return {k: v for k, v in answer.items() if k not in _PRIVATE_ANSWER_FIELDS}
+
+
 def _recompute_session_scoring(session: dict) -> tuple[list[dict], int]:
+    """Recompute phase_results and overall_score from the raw answers array.
+    Called after a manual review override so the stored document stays consistent.
+    Handles answers with score=None (pending async scoring) by treating them as 0,
+    and strips private binary fields before embedding answers in phase_results."""
     phase_results: list[dict] = []
     phase_scores: dict[str, int] = {}
 
@@ -185,13 +202,18 @@ def _recompute_session_scoring(session: dict) -> tuple[list[dict], int]:
         ]
         if not answers:
             continue
-        phase_score = round(sum(answer["score"] for answer in answers) / len(answers))
+        # Pending async answers have score=None — treat as 0 so the arithmetic
+        # doesn't crash.  Also strip private binary fields from every answer
+        # before embedding in phase_results (guards against MongoDB 16 MB limit).
+        phase_score = round(
+            sum((answer.get("score") or 0) for answer in answers) / len(answers)
+        )
         phase_scores[phase] = phase_score
         phase_results.append({
             "phase": phase,
             "score": phase_score,
             "question_count": len(answers),
-            "answers": answers,
+            "answers": [_clean_answer(answer) for answer in answers],
         })
 
     weights = _phase_weights(list(phase_scores.keys()))
@@ -295,6 +317,15 @@ async def list_candidates(
     _current_user: dict = Depends(require_role("admin", "superadmin")),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
+    """Paginated, searchable candidate directory.
+
+    Agent Rule #4: all per-user stats (enrollment count, session count, average
+    score) are fetched as a single aggregation over the relevant collection per
+    stat type — not one query per user (the previous N+1 pattern).  Two
+    collection-wide `$group` passes (enrollments and sessions) produce a
+    lookup-map keyed by user_id; the per-page user list is then enriched from
+    those maps without any additional DB round-trips.
+    """
     query: dict = {}
     if role:
         query["role"] = role
@@ -303,9 +334,8 @@ async def list_candidates(
         query["$or"] = [{"email": pattern}, {"display_name": pattern}]
 
     if track_id:
-        # `enrollments.user_id` stores the stringified user ObjectId — collect
-        # the matching ids first (a single `distinct`, a Mongo-side command,
-        # not an in-memory scan), then narrow the user query by `_id`.
+        # Collect the enrolled user IDs via a single `distinct` command —
+        # no in-memory scan; just narrows the user query by `_id`.
         enrolled_user_ids = await db["enrollments"].distinct("user_id", {"track_id": track_id})
         object_ids: list[ObjectId] = []
         for raw_id in enrolled_user_ids:
@@ -318,31 +348,55 @@ async def list_candidates(
     total = await db["users"].count_documents(query)
     pages = max(math.ceil(total / limit), 1)
 
-    cursor = (
+    users_page = await (
         db["users"]
         .find(query)
         .sort("created_at", -1)
         .skip((page - 1) * limit)
         .limit(limit)
+        .to_list(length=limit)
     )
+    if not users_page:
+        return {"candidates": [], "total": total, "page": page, "pages": pages}
+
+    user_ids = [str(user["_id"]) for user in users_page]
+
+    # ------------------------------------------------------------------ #
+    # One aggregation per cross-collection stat — not one query per user. #
+    # ------------------------------------------------------------------ #
+
+    # Enrollment counts keyed by user_id
+    enrollment_buckets = await db["enrollments"].aggregate([
+        {"$match": {"user_id": {"$in": user_ids}}},
+        {"$group": {"_id": "$user_id", "n": {"$sum": 1}}},
+    ]).to_list(length=None)
+    enrollment_count_by_user = {bucket["_id"]: bucket["n"] for bucket in enrollment_buckets}
+
+    # Completed session count + average score keyed by user_id — both in one pass
+    session_buckets = await db["sessions"].aggregate([
+        {"$match": {"user_id": {"$in": user_ids}, "status": "completed"}},
+        {"$group": {
+            "_id": "$user_id",
+            "n": {"$sum": 1},
+            "avg": {"$avg": "$overall_score"},
+        }},
+    ]).to_list(length=None)
+    session_stats_by_user: dict[str, dict] = {
+        bucket["_id"]: {
+            "count": bucket["n"],
+            "avg": round(bucket["avg"], 1) if bucket["avg"] is not None else None,
+        }
+        for bucket in session_buckets
+    }
 
     candidates: list[dict] = []
-    async for user in cursor:
+    for user in users_page:
         user_id = str(user["_id"])
-
-        enrollment_count = await db["enrollments"].count_documents({"user_id": user_id})
-        session_count = await db["sessions"].count_documents({"user_id": user_id, "status": "completed"})
-
-        avg_bucket = await db["sessions"].aggregate([
-            {"$match": {"user_id": user_id, "status": "completed"}},
-            {"$group": {"_id": None, "avg": {"$avg": "$overall_score"}}},
-        ]).to_list(length=1)
-        average_score = round(avg_bucket[0]["avg"], 1) if avg_bucket and avg_bucket[0]["avg"] is not None else None
-
         enriched = _serialize(user)
-        enriched["enrollment_count"] = enrollment_count
-        enriched["session_count"] = session_count
-        enriched["average_score"] = average_score
+        enriched["enrollment_count"] = enrollment_count_by_user.get(user_id, 0)
+        sess = session_stats_by_user.get(user_id, {})
+        enriched["session_count"] = sess.get("count", 0)
+        enriched["average_score"] = sess.get("avg")
         candidates.append(enriched)
 
     return {"candidates": candidates, "total": total, "page": page, "pages": pages}

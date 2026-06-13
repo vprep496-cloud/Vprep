@@ -1,12 +1,12 @@
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
 from app.api.v1.tracks import get_track_or_none
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
-from app.models.session import AnswerSubmission, BatchTextAnswerSubmission, SessionComplete, SessionCreate
+from app.models.session import AnswerSubmission, BatchTextAnswerSubmission, CodingAnswerSubmission, SessionComplete, SessionCreate, VoiceAnswerSubmission
 from app.services import interview_service
 
 router = APIRouter()
@@ -51,7 +51,9 @@ async def start_interview(
             detail="You must enroll in this track before starting a mock interview.",
         )
 
-    return await interview_service.start_session(current_user["id"], payload.track_id, payload.mode, db)
+    return await interview_service.start_session(
+        current_user["id"], payload.track_id, payload.mode, db, intensity=payload.intensity
+    )
 
 
 @router.post("/answer")
@@ -302,6 +304,116 @@ async def submit_text_answer_batch(
 
     await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": {"$each": answer_docs}}})
     return {"answers": responses}
+
+
+@router.post("/answer-coding", status_code=status.HTTP_202_ACCEPTED)
+async def submit_coding_answer(
+    payload: CodingAnswerSubmission,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Accept a handwritten coding answer immediately (202 Accepted) and kick
+    off background OCR+AI scoring.  The client should poll
+    GET /session/{id}/coding-status until status == 'complete' | 'failed'.
+
+    This prevents the user waiting 30-90s for OCR+LLM to finish before they
+    can navigate to the results screen."""
+    # Ownership check
+    session = await _get_owned_session(payload.session_id, current_user["id"], db)
+    _ = session  # used only for auth — actual validation inside service
+
+    result = await interview_service.submit_coding_answer_async(
+        session_id=payload.session_id,
+        question_id=payload.question_id,
+        image_base64=payload.image_base64,
+        image_mime_type=payload.image_mime_type,
+        image_width=payload.image_width,
+        image_height=payload.image_height,
+        image_size_bytes=payload.image_size_bytes,
+        db=db,
+    )
+
+    # Kick off scoring in the background (non-blocking)
+    background_tasks.add_task(
+        interview_service._score_coding_answer_background,
+        payload.session_id,
+        payload.question_id,
+        db,
+    )
+
+    return result
+
+
+@router.get("/session/{session_id}/coding-status")
+async def get_coding_status(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Poll the async scoring status for all coding_logic answers in a session.
+
+    Returns a list of {question_id, status, score, feedback, ...} objects.
+    The client polls this until every status is 'complete' or 'failed'."""
+    statuses = await interview_service.get_coding_score_status(session_id, current_user["id"], db)
+    return {"coding_answers": statuses}
+
+
+@router.post("/answer-voice", status_code=status.HTTP_202_ACCEPTED)
+async def submit_voice_answer(
+    payload: VoiceAnswerSubmission,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Accept a voice answer immediately (202 Accepted) and kick off background
+    Whisper transcription + Ollama scoring.  The client should poll
+    GET /session/{id}/voice-status until status == 'complete' | 'failed'.
+
+    This lets the user continue to the next question without waiting 10-30s for
+    the local AI pipeline to finish — identical async pattern to /answer-coding."""
+    if not payload.audio_base64:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="audio_base64 is required.")
+    if payload.phase not in ("hr", "behavioral"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Async voice scoring is for hr and behavioral phases.")
+
+    # Ownership check
+    session = await _get_owned_session(payload.session_id, current_user["id"], db)
+    _ = session  # used only for auth — validation inside service
+
+    result = await interview_service.submit_voice_answer_async(
+        session_id=payload.session_id,
+        question_id=payload.question_id,
+        phase=payload.phase,
+        audio_base64=payload.audio_base64,
+        audio_format=payload.audio_format,
+        duration_seconds=payload.answer_duration_seconds,
+        db=db,
+    )
+
+    # Kick off Whisper + Ollama scoring in the background (non-blocking)
+    background_tasks.add_task(
+        interview_service._score_voice_answer_background,
+        payload.session_id,
+        payload.question_id,
+        db,
+    )
+
+    return result
+
+
+@router.get("/session/{session_id}/voice-status")
+async def get_voice_status(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Poll the async scoring status for all voice answers in a session.
+
+    Returns a list of {question_id, phase, status, score, feedback, ...} objects.
+    The client polls this until every status is 'complete' or 'failed'."""
+    statuses = await interview_service.get_voice_score_status(session_id, current_user["id"], db)
+    return {"voice_answers": statuses}
 
 
 @router.post("/complete")

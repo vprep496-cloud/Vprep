@@ -13,6 +13,10 @@ router = APIRouter()
 
 class TrackIdBody(BaseModel):
     track_id: str
+    # Optional target role chosen on the tracks screen before the assessment
+    # starts, so the questions personalize to it from the very first one.
+    target_role_id: str | None = None
+    target_role: str | None = None
 
 
 class SubmitBody(BaseModel):
@@ -44,7 +48,11 @@ async def generate_questions(
     await _validate_track_id(payload.track_id, db)
 
     session_id, questions = await assessment_service.generate_questions(
-        payload.track_id, current_user["id"], background_tasks
+        payload.track_id,
+        current_user["id"],
+        background_tasks,
+        target_role_id=payload.target_role_id,
+        target_role=payload.target_role,
     )
 
     return {"session_id": session_id, "questions": questions, "track_id": payload.track_id}
@@ -179,7 +187,11 @@ async def retake_assessment(
     await _validate_track_id(payload.track_id, db)
 
     session_id, questions = await assessment_service.generate_questions(
-        payload.track_id, current_user["id"], background_tasks
+        payload.track_id,
+        current_user["id"],
+        background_tasks,
+        target_role_id=payload.target_role_id,
+        target_role=payload.target_role,
     )
 
     return {"session_id": session_id, "questions": questions, "track_id": payload.track_id}

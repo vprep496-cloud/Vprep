@@ -3,6 +3,7 @@
 # app/api/v1/interview.py stay thin and only handle request validation,
 # ownership checks, and persistence orchestration — mirroring the Phase 3/4
 # service/router split (assessment_service.py / enrollment_service.py).
+import asyncio
 import base64
 import logging
 from datetime import datetime, timezone
@@ -16,6 +17,11 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.models.enrollment import EnrollmentProgress
 from app.services import admin_ai_service, enrollment_service
 from app.services.profile_service import normalize_level
+from app.services.role_catalog import (
+    effective_difficulty,
+    focus_for_role,
+    infer_seniority_from_label,
+)
 from app.services.scoring_engine import (
     RUBRIC_VERSION,
     score_assessment_batch,
@@ -40,6 +46,18 @@ PHASES_BY_MODE: dict[str, list[str]] = {
 }
 
 _QUESTION_COUNT_BY_PHASE = {"hr": 4, "technical": 4, "coding_logic": 1, "behavioral": 4}
+
+# Intensity multipliers: "quick" ≈ half, "standard" = 1×, "deep" ≈ 1.5×.
+# Coding logic is always 1 regardless (limited by how many problems fit in a session).
+_INTENSITY_MULTIPLIERS = {"quick": 0.5, "standard": 1.0, "deep": 1.5}
+
+
+def _question_count_for_intensity(phase: str, intensity: str) -> int:
+    base = _QUESTION_COUNT_BY_PHASE[phase]
+    multiplier = _INTENSITY_MULTIPLIERS.get(intensity, 1.0)
+    if phase == "coding_logic":
+        return 1  # always exactly one coding problem
+    return max(1, round(base * multiplier))
 
 # complete_session's weighted-average rule. When a phase is absent (HR Only,
 # Technical Only, Behavioral Only sessions), its weight is redistributed
@@ -73,10 +91,13 @@ def _question_track_filter(phase: str, track_id: str) -> str | dict:
     return {"$in": ["all", track_id]} if phase in ("hr", "behavioral", "coding_logic") else track_id
 
 
-def _difficulty_for_skill_level(skill_level: str) -> str:
-    return {"beginner": "easy", "intermediate": "medium", "advanced": "hard"}.get(
-        normalize_level(skill_level),
-        "medium",
+def _difficulty_for_profile(candidate_profile: dict[str, Any]) -> str:
+    """Question difficulty blends the candidate's assessed skill with the
+    seniority of the role they're targeting — so a Junior role yields easier
+    questions and a Senior role harder ones, even at the same skill level."""
+    return effective_difficulty(
+        normalize_level(candidate_profile.get("skill_level")),
+        candidate_profile.get("role_seniority"),
     )
 
 
@@ -139,9 +160,22 @@ async def _candidate_profile_for_interview(
         or "beginner"
     )
 
+    # Per-track role first: each enrollment carries its own target role + its
+    # seniority and focus areas, so interview questions personalize to the role
+    # the candidate is actually targeting on this track (and its difficulty).
+    target_role = (
+        (enrollment or {}).get("target_role")
+        or (user or {}).get("target_role")
+        or profile.get("target_role")
+    )
+    role_seniority = (enrollment or {}).get("role_seniority") or infer_seniority_from_label(target_role)
+    role_focus = focus_for_role(track_id, (enrollment or {}).get("target_role_id"), target_role)
+
     return {
         "skill_level": normalize_level(skill_level),
-        "target_role": (user or {}).get("target_role") or profile.get("target_role"),
+        "target_role": target_role,
+        "role_seniority": role_seniority,
+        "role_focus": role_focus,
         "skills": profile.get("skills") if isinstance(profile.get("skills"), list) else [],
         "projects": profile.get("projects") if isinstance(profile.get("projects"), list) else [],
         "primary_roles": profile.get("primary_roles") if isinstance(profile.get("primary_roles"), list) else [],
@@ -156,15 +190,35 @@ def _auto_fill_guidance(phase: str, candidate_profile: dict[str, Any]) -> str:
     projects = "; ".join(str(project) for project in candidate_profile.get("projects", [])[:4])
     roles = ", ".join(str(role) for role in candidate_profile.get("primary_roles", [])[:4])
     target_role = candidate_profile.get("target_role")
+    seniority = candidate_profile.get("role_seniority") or "mid"
+    role_focus = ", ".join(str(area) for area in candidate_profile.get("role_focus", [])[:8])
     years = candidate_profile.get("years_experience")
     level = candidate_profile["skill_level"]
 
+    if seniority == "junior":
+        difficulty_note = (
+            "This is a JUNIOR/entry-level target role: keep questions fundamental and approachable, "
+            "focused on core concepts and practical basics rather than deep system design or advanced edge cases."
+        )
+    elif seniority == "senior":
+        difficulty_note = (
+            "This is a SENIOR target role: questions should be challenging and probe depth, tradeoffs, "
+            "system design, scalability, and judgment, not just definitions."
+        )
+    else:
+        difficulty_note = (
+            "This is a mid-level target role: balance core understanding with practical depth, "
+            "reasoning, and realistic tradeoffs."
+        )
+
     return (
-        f"Auto-fill a reusable question-bank shortage for {level}-level candidates. "
-        f"Target role context: {target_role or roles or 'general candidate for this track'}. "
+        f"Auto-fill a reusable question-bank shortage for the target role "
+        f"'{target_role or 'candidate for this track'}' (candidate assessed skill level: {level}). "
+        f"{difficulty_note} "
+        f"Tailor the questions to this role's focus areas: {role_focus or 'use the track topic areas'}. "
         f"Years of experience signal: {years if years is not None else 'not provided'}. "
-        f"Relevant skills to reflect when useful: {skills or 'use the track topic areas'}. "
-        f"Project-style signals to reflect generically when useful: {projects or 'not provided'}. "
+        f"Other relevant skills to reflect when useful: {skills or 'use the track topic areas'}. "
+        f"Project-style signals to reflect generically when useful: {projects or roles or 'not provided'}. "
         "Do not include candidate names, employers, schools, or any personal identifiers. "
         "Create professional interview questions that can safely be reused for similar candidates. "
         f"Phase needing questions: {phase}."
@@ -316,7 +370,7 @@ async def _ensure_question_supply(
     count: int,
     candidate_profile: dict[str, Any],
 ) -> list[dict]:
-    difficulty = _difficulty_for_skill_level(candidate_profile["skill_level"])
+    difficulty = _difficulty_for_profile(candidate_profile)
     sampled = await _sample_questions(db, phase, track_id, count, preferred_difficulty=difficulty)
     if len(sampled) >= count:
         return sampled
@@ -354,15 +408,27 @@ async def _ensure_question_supply(
 
 
 def _audio_mime_type(audio_format: str | None) -> str:
-    """Map the client-reported recording format to a local extraction mime type.
+    """Map the client-reported recording format to a MIME type for the AI pipeline.
 
-    `VoiceRecorder.tsx` always records HIGH_QUALITY presets, which default to
-    m4a — "audio/wav" is accepted as a defensive fallback per the spec's
-    "audio/m4a or audio/wav depending on the recording format" guidance.
+    Native platforms (iOS/Android) record in m4a by default (HIGH_QUALITY preset).
+    React Native web uses the browser MediaRecorder which defaults to audio/webm
+    (codec: opus). We must pass the correct MIME type so faster-whisper / ffmpeg
+    selects the right decoder.
     """
-    if audio_format and "wav" in audio_format.lower():
+    if not audio_format:
+        return "audio/m4a"
+    fmt = audio_format.lower()
+    if "wav" in fmt:
         return "audio/wav"
-    return "audio/m4a"
+    if "webm" in fmt or "opus" in fmt:
+        return "audio/webm"
+    if "mp3" in fmt or "mpeg" in fmt:
+        return "audio/mpeg"
+    if "ogg" in fmt:
+        return "audio/ogg"
+    if "aac" in fmt or "m4a" in fmt or "mp4" in fmt:
+        return "audio/m4a"
+    return "audio/m4a"  # safe fallback
 
 
 def _image_mime_type(image_mime_type: str | None) -> str:
@@ -376,19 +442,27 @@ def _image_mime_type(image_mime_type: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def start_session(user_id: str, track_id: str, mode: str, db: AsyncIOMotorDatabase) -> dict:
+async def start_session(
+    user_id: str,
+    track_id: str,
+    mode: str,
+    db: AsyncIOMotorDatabase,
+    intensity: str = "standard",
+) -> dict:
     """Sample questions for every phase the mode requires, persist the full
     session document (including model_answer — Agent Rule #5), and return a
     sanitized SessionStartResponse-shaped dict."""
     if mode not in VALID_MODES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid interview mode.")
+    if intensity not in _INTENSITY_MULTIPLIERS:
+        intensity = "standard"
 
     phases = PHASES_BY_MODE[mode]
     questions_by_phase: dict[str, list[dict]] = {}
     candidate_profile = await _candidate_profile_for_interview(user_id, track_id, db)
 
     for phase in phases:
-        count = _QUESTION_COUNT_BY_PHASE[phase]
+        count = _question_count_for_intensity(phase, intensity)
         questions_by_phase[phase] = await _ensure_question_supply(
             db,
             phase,
@@ -430,6 +504,7 @@ async def start_session(user_id: str, track_id: str, mode: str, db: AsyncIOMotor
         "session_id": str(insert_result.inserted_id),
         "track_id": track_id,
         "mode": mode,
+        "intensity": intensity,
         "phases": phases,
         "questions": sanitized_questions,
         "started_at": now,
@@ -442,14 +517,94 @@ async def score_voice_answer(
     audio_format: str | None = None,
     duration_seconds: int | None = None,
 ) -> dict:
-    """Send audio inline to the scoring engine for transcribe+score."""
+    """Transcribe and score a voice answer.
+
+    If Ollama scoring fails after retries (503 from the scoring engine), the
+    answer is still recorded — transcription is preserved, score is set to 0,
+    and the answer is flagged for manual review. This ensures the candidate
+    never loses a submitted answer because the local model was slow or briefly
+    unavailable.
+    """
     try:
         audio_bytes = base64.b64decode(audio_base64)
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid audio data.") from exc
 
     mime_type = _audio_mime_type(audio_format)
-    return await score_interview_audio(question, audio_bytes, mime_type, duration_seconds=duration_seconds)
+    try:
+        return await score_interview_audio(question, audio_bytes, mime_type, duration_seconds=duration_seconds)
+    except HTTPException as scoring_exc:
+        # Scoring engine gives 503 when Ollama is unavailable or times out.
+        # Instead of propagating the 503 to the client (which would lose the
+        # answer), fall back: record transcription + score=0 + manual-review flag.
+        # The candidate still sees their answer saved and gets a clear message.
+        if scoring_exc.status_code != status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise  # don't swallow 4xx errors
+
+        # Attempt transcription-only (Whisper runs locally, separate from Ollama)
+        transcription = ""
+        try:
+            from app.services.ai_provider import _audio_suffix, _get_or_create_whisper_model  # noqa: PLC0415
+            import asyncio as _asyncio, tempfile as _tempfile  # noqa: PLC0415
+            from pathlib import Path as _Path  # noqa: PLC0415
+
+            async def _transcribe_only() -> str:
+                suffix = _audio_suffix(mime_type)
+                model = await _asyncio.to_thread(_get_or_create_whisper_model)
+                with _tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = _Path(tmp.name)
+                try:
+                    segments, _ = await _asyncio.to_thread(
+                        model.transcribe,
+                        str(tmp_path),
+                        beam_size=3,
+                        vad_filter=True,
+                        language="en",
+                        word_timestamps=False,
+                    )
+                    return " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+
+            transcription = await _transcribe_only()
+        except Exception as transcribe_exc:
+            logger.warning("[score_voice_answer] fallback transcription also failed: %s", transcribe_exc)
+
+        from app.services.scoring_engine import RUBRIC_VERSION, scoring_mode_for_question  # noqa: PLC0415
+
+        mode = scoring_mode_for_question(question)
+        if mode not in {"hr_voice", "behavioral_voice"}:
+            mode = "hr_voice"
+        logger.warning(
+            "[score_voice_answer] Ollama scoring unavailable (503). "
+            "Recording answer with score=0 + manual_review flag. mode=%s",
+            mode,
+        )
+        return {
+            "transcription": transcription,
+            "overall_score": 0,
+            "criteria_scores": {},
+            "confidence": 0.0,
+            "strengths": [],
+            "improvements": ["AI scoring was temporarily unavailable. Your answer has been saved for manual review."],
+            "review_flags": ["ai_scoring_unavailable", "manual_review_recommended"],
+            "evidence": [],
+            "score_rationale": "AI scoring service was unavailable at submission time.",
+            "feedback": (
+                "Your answer was received and saved. AI scoring was temporarily unavailable, "
+                "so it has been flagged for manual review. Your transcript has been preserved."
+            ),
+            "model_answer": question.get("model_answer", ""),
+            "rubric_version": RUBRIC_VERSION,
+            "scoring_mode": f"{mode}_fallback",
+            "scoring_metadata": {
+                "rubric_version": RUBRIC_VERSION,
+                "scoring_mode": f"{mode}_fallback",
+                "review_flags": ["ai_scoring_unavailable", "manual_review_recommended"],
+                "provider": "ollama_unavailable",
+            },
+        }
 
 
 async def score_text_answer(question: dict, text_answer: str) -> dict:
@@ -515,6 +670,545 @@ async def score_image_answer(question: dict, image_base64: str, image_mime_type:
     return await score_interview_image(question, image_bytes, mime_type)
 
 
+async def submit_coding_answer_async(
+    session_id: str,
+    question_id: str,
+    image_base64: str,
+    image_mime_type: str | None,
+    image_width: int | None,
+    image_height: int | None,
+    image_size_bytes: int | None,
+    db: AsyncIOMotorDatabase,
+) -> dict:
+    """Accept a coding answer immediately, persist a 'pending' placeholder, and
+    return right away.  The caller is responsible for kicking off a BackgroundTask
+    to run `_score_coding_answer_background`."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+    if session["status"] != "in_progress":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session already completed.")
+
+    phase_questions = session.get("questions_by_phase", {}).get("coding_logic", [])
+    question = next((q for q in phase_questions if q["id"] == question_id), None)
+    if question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in this session.")
+    if question.get("answer_type") != "image":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This question requires an image answer.")
+
+    already_answered = any(a["question_id"] == question_id for a in session.get("answers", []))
+    if already_answered:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Answer already submitted for this question.")
+
+    # Persist a placeholder — scored=0 / status=pending so complete_session can proceed.
+    review_flags: list[str] = []
+    if image_width and image_height and max(image_width, image_height) < 700:
+        review_flags.append("low_resolution_image")
+    if image_size_bytes and image_size_bytes > 8 * 1024 * 1024:
+        review_flags.append("large_image_upload")
+
+    placeholder = {
+        "question_id": question_id,
+        "question_text": question["question_text"],
+        "phase": "coding_logic",
+        "answer_type": "image",
+        "transcription": None,
+        "user_text_answer": None,
+        "answer_duration_seconds": None,
+        "image_width": image_width,
+        "image_height": image_height,
+        "image_size_bytes": image_size_bytes,
+        "score": 0,
+        "criteria_scores": {},
+        "feedback": "Scoring in progress — results will appear within 3–5 minutes.",
+        "model_answer": question.get("model_answer", ""),
+        "confidence": None,
+        "strengths": [],
+        "improvements": [],
+        "review_flags": review_flags,
+        "evidence": [],
+        "score_rationale": None,
+        "rubric_version": None,
+        "scoring_mode": "async_coding",
+        "scoring_metadata": {"review_flags": review_flags},
+        "ai_score": None,
+        "ai_criteria_scores": None,
+        "ai_feedback": None,
+        "ai_confidence": None,
+        "ai_review_flags": review_flags,
+        "ai_scoring_metadata": None,
+        "manual_review_status": "pending",
+        "reviewer_notes": None,
+        "reviewed_by": None,
+        "reviewed_at": None,
+        # Async status tracking
+        "coding_score_status": "pending",
+        # Store base64 for background processing (stripped after scoring)
+        "_coding_image_base64": image_base64,
+        "_coding_image_mime_type": image_mime_type or "image/jpeg",
+    }
+
+    await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": placeholder}})
+    logger.info("Coding answer placeholder stored. session_id=%s question_id=%s", session_id, question_id)
+
+    return {
+        "question_id": question_id,
+        "status": "pending",
+        "message": "Your coding answer has been received. Scoring will complete within 3–5 minutes.",
+        "estimated_seconds": 180,
+    }
+
+
+async def _score_coding_answer_background(
+    session_id: str,
+    question_id: str,
+    db: AsyncIOMotorDatabase,
+) -> None:
+    """Background task: retrieve stored image, run OCR+AI scoring, patch the answer doc."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    from app.services.notification_service import send_coding_result_notification
+
+    logger.info("Background coding score started. session_id=%s question_id=%s", session_id, question_id)
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        logger.error("Background coding score: invalid session_id=%s", session_id)
+        return
+
+    # Mark as processing
+    await db["sessions"].update_one(
+        {"_id": object_id, "answers.question_id": question_id},
+        {"$set": {"answers.$.coding_score_status": "processing"}},
+    )
+
+    try:
+        session = await db["sessions"].find_one({"_id": object_id})
+        if session is None:
+            return
+
+        answer = next((a for a in session.get("answers", []) if a["question_id"] == question_id), None)
+        if answer is None:
+            return
+
+        image_base64 = answer.get("_coding_image_base64")
+        image_mime_type = answer.get("_coding_image_mime_type", "image/jpeg")
+
+        if not image_base64:
+            raise ValueError("No image data stored for background scoring.")
+
+        phase_questions = session.get("questions_by_phase", {}).get("coding_logic", [])
+        question = next((q for q in phase_questions if q["id"] == question_id), None)
+        if question is None:
+            raise ValueError("Question not found in session.")
+
+        scored = await score_image_answer(question, image_base64, image_mime_type)
+
+        review_flags = sorted(set(list(scored.get("review_flags", [])) + answer.get("review_flags", [])))
+        scoring_metadata = dict(scored.get("scoring_metadata") or {})
+        scoring_metadata["review_flags"] = review_flags
+        final_score = max(0, min(int(scored.get("overall_score", 0)), 100))
+
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.score": final_score,
+                "answers.$.criteria_scores": scored.get("criteria_scores", {}),
+                "answers.$.feedback": scored.get("feedback", ""),
+                "answers.$.transcription": scored.get("transcription"),
+                "answers.$.model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+                "answers.$.confidence": scored.get("confidence"),
+                "answers.$.strengths": scored.get("strengths", []),
+                "answers.$.improvements": scored.get("improvements", []),
+                "answers.$.review_flags": review_flags,
+                "answers.$.evidence": scored.get("evidence", []),
+                "answers.$.score_rationale": scored.get("score_rationale"),
+                "answers.$.rubric_version": scored.get("rubric_version"),
+                "answers.$.scoring_mode": scored.get("scoring_mode"),
+                "answers.$.scoring_metadata": scoring_metadata,
+                "answers.$.ai_score": final_score,
+                "answers.$.ai_criteria_scores": scored.get("criteria_scores", {}),
+                "answers.$.ai_feedback": scored.get("feedback", ""),
+                "answers.$.ai_confidence": scored.get("confidence"),
+                "answers.$.ai_review_flags": review_flags,
+                "answers.$.ai_scoring_metadata": scoring_metadata,
+                "answers.$.manual_review_status": "pending" if "manual_review_recommended" in review_flags else "not_required",
+                "answers.$.coding_score_status": "complete",
+                # Clean up stored image bytes (no longer needed)
+                "answers.$._coding_image_base64": None,
+            }},
+        )
+
+        logger.info(
+            "Background coding score complete. session_id=%s question_id=%s score=%d",
+            session_id, question_id, final_score,
+        )
+
+        # Send push notification to user
+        try:
+            await send_coding_result_notification(session["user_id"], final_score, db)
+        except Exception as notify_exc:
+            logger.warning("Coding result notification failed: %s", notify_exc)
+
+    except Exception as exc:
+        logger.error(
+            "Background coding score failed. session_id=%s question_id=%s error=%s",
+            session_id, question_id, exc,
+        )
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.coding_score_status": "failed",
+                "answers.$.feedback": "Automatic scoring failed. Our team will review your submission manually.",
+                "answers.$.manual_review_status": "pending",
+            }},
+        )
+
+
+async def get_coding_score_status(
+    session_id: str,
+    user_id: str,
+    db: AsyncIOMotorDatabase,
+) -> list[dict]:
+    """Return async scoring status for every coding_logic answer in the session."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    results = []
+    for answer in session.get("answers", []):
+        if answer.get("phase") != "coding_logic":
+            continue
+        status_val = answer.get("coding_score_status", "complete")
+        results.append({
+            "question_id": answer["question_id"],
+            "status": status_val,
+            "score": answer.get("score") if status_val == "complete" else None,
+            "feedback": answer.get("feedback") if status_val == "complete" else None,
+            "transcription": answer.get("transcription"),
+            "criteria_scores": answer.get("criteria_scores", {}) if status_val == "complete" else {},
+            "estimated_seconds": 0 if status_val == "complete" else 180,
+        })
+    return results
+
+
+async def submit_voice_answer_async(
+    session_id: str,
+    question_id: str,
+    phase: str,
+    audio_base64: str,
+    audio_format: str | None,
+    duration_seconds: int | None,
+    db: AsyncIOMotorDatabase,
+) -> dict:
+    """Accept a voice answer immediately, persist a 'pending' placeholder, and
+    return right away (202 Accepted).  The caller kicks off a BackgroundTask to
+    run `_score_voice_answer_background` — identical pattern to coding async."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+    if session["status"] != "in_progress":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session already completed.")
+
+    phase_questions = session.get("questions_by_phase", {}).get(phase, [])
+    question = next((q for q in phase_questions if q["id"] == question_id), None)
+    if question is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in this session.")
+    if question.get("answer_type") != "voice":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="This question requires a voice answer.")
+
+    already_answered = any(a["question_id"] == question_id for a in session.get("answers", []))
+    if already_answered:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Answer already submitted for this question.")
+
+    placeholder = {
+        "question_id": question_id,
+        "question_text": question["question_text"],
+        "phase": phase,
+        "answer_type": "voice",
+        "transcription": None,
+        "user_text_answer": None,
+        "answer_duration_seconds": duration_seconds,
+        "image_width": None,
+        "image_height": None,
+        "image_size_bytes": None,
+        "score": 0,
+        "criteria_scores": {},
+        "feedback": "Voice answer received — transcribing and scoring in the background.",
+        "model_answer": question.get("model_answer", ""),
+        "confidence": None,
+        "strengths": [],
+        "improvements": [],
+        "review_flags": [],
+        "evidence": [],
+        "score_rationale": None,
+        "rubric_version": None,
+        "scoring_mode": "async_voice",
+        "scoring_metadata": {},
+        "ai_score": None,
+        "ai_criteria_scores": None,
+        "ai_feedback": None,
+        "ai_confidence": None,
+        "ai_review_flags": [],
+        "ai_scoring_metadata": None,
+        "manual_review_status": "pending",
+        "reviewer_notes": None,
+        "reviewed_by": None,
+        "reviewed_at": None,
+        # Async voice status tracking
+        "voice_score_status": "pending",
+        # Store raw audio for background processing (cleared after scoring)
+        "_voice_audio_base64": audio_base64,
+        "_voice_audio_format": audio_format or "",
+    }
+
+    await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": placeholder}})
+    logger.info("Voice answer placeholder stored. session_id=%s question_id=%s phase=%s", session_id, question_id, phase)
+
+    return {
+        "question_id": question_id,
+        "status": "pending",
+        "message": "Your voice answer has been received. We're transcribing and scoring it in the background — you'll get a notification when it's ready.",
+        "estimated_seconds": 90,
+    }
+
+
+async def _score_voice_answer_background(
+    session_id: str,
+    question_id: str,
+    db: AsyncIOMotorDatabase,
+) -> None:
+    """Background task: retrieve stored audio, run Whisper transcription +
+    Ollama scoring, patch the answer doc, and push a notification.
+
+    Retry strategy (exponential backoff):
+      Attempt 1 — immediate
+      Attempt 2 — wait 5 s  (transient Ollama glitch)
+      Attempt 3 — wait 20 s (longer model warm-up / OOM recovery)
+    After 3 failures the answer is marked "failed" and flagged for manual review.
+    Each attempt has a 180-second asyncio timeout guard to prevent zombie jobs.
+    """
+    from bson import ObjectId
+    from bson.errors import InvalidId
+    from app.services.notification_service import send_voice_result_notification
+
+    logger.info("Background voice score started. session_id=%s question_id=%s", session_id, question_id)
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        logger.error("Background voice score: invalid session_id=%s", session_id)
+        return
+
+    # Mark as processing immediately so the status endpoint reflects reality
+    await db["sessions"].update_one(
+        {"_id": object_id, "answers.question_id": question_id},
+        {"$set": {"answers.$.voice_score_status": "processing"}},
+    )
+
+    _RETRY_DELAYS = (0, 5, 20)   # seconds before each attempt (0 = immediate first try)
+    _SCORE_TIMEOUT = 180          # per-attempt timeout in seconds
+
+    last_exc: Exception | None = None
+
+    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
+        if delay > 0:
+            logger.info(
+                "Background voice score retry %d/%d in %ds. session_id=%s question_id=%s",
+                attempt, len(_RETRY_DELAYS), delay, session_id, question_id,
+            )
+            await asyncio.sleep(delay)
+
+        try:
+            session = await db["sessions"].find_one({"_id": object_id})
+            if session is None:
+                return
+
+            answer = next(
+                (a for a in session.get("answers", []) if a["question_id"] == question_id),
+                None,
+            )
+            if answer is None:
+                return
+
+            audio_base64 = answer.get("_voice_audio_base64")
+            audio_format = answer.get("_voice_audio_format") or None
+            phase = answer.get("phase", "hr")
+
+            if not audio_base64:
+                raise ValueError("No audio data stored for background scoring.")
+
+            # Retrieve the full question (with model_answer) from questions_by_phase
+            phase_questions = session.get("questions_by_phase", {}).get(phase, [])
+            question = next((q for q in phase_questions if q["id"] == question_id), None)
+            if question is None:
+                raise ValueError("Question not found in session.")
+
+            # Guard against Ollama hang — hard timeout per scoring attempt
+            scored = await asyncio.wait_for(
+                score_voice_answer(
+                    question, audio_base64, audio_format, answer.get("answer_duration_seconds")
+                ),
+                timeout=_SCORE_TIMEOUT,
+            )
+
+            review_flags = sorted(set(list(scored.get("review_flags", [])) + answer.get("review_flags", [])))
+            scoring_metadata = dict(scored.get("scoring_metadata") or {})
+            scoring_metadata["review_flags"] = review_flags
+            final_score = max(0, min(int(scored.get("overall_score", 0)), 100))
+
+            manual_review = (
+                "pending"
+                if "manual_review_recommended" in review_flags
+                else "not_required"
+            )
+
+            await db["sessions"].update_one(
+                {"_id": object_id, "answers.question_id": question_id},
+                {"$set": {
+                    "answers.$.score": final_score,
+                    "answers.$.transcription": scored.get("transcription"),
+                    "answers.$.criteria_scores": scored.get("criteria_scores", {}),
+                    "answers.$.feedback": scored.get("feedback", ""),
+                    "answers.$.model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+                    "answers.$.confidence": scored.get("confidence"),
+                    "answers.$.strengths": scored.get("strengths", []),
+                    "answers.$.improvements": scored.get("improvements", []),
+                    "answers.$.review_flags": review_flags,
+                    "answers.$.evidence": scored.get("evidence", []),
+                    "answers.$.score_rationale": scored.get("score_rationale"),
+                    "answers.$.rubric_version": scored.get("rubric_version"),
+                    "answers.$.scoring_mode": scored.get("scoring_mode"),
+                    "answers.$.scoring_metadata": scoring_metadata,
+                    "answers.$.star_analysis": scored.get("star_analysis"),
+                    "answers.$.ai_score": final_score,
+                    "answers.$.ai_criteria_scores": scored.get("criteria_scores", {}),
+                    "answers.$.ai_feedback": scored.get("feedback", ""),
+                    "answers.$.ai_confidence": scored.get("confidence"),
+                    "answers.$.ai_review_flags": review_flags,
+                    "answers.$.ai_scoring_metadata": scoring_metadata,
+                    "answers.$.manual_review_status": manual_review,
+                    "answers.$.voice_score_status": "complete",
+                    # Strip stored audio after successful scoring
+                    "answers.$._voice_audio_base64": None,
+                }},
+            )
+
+            logger.info(
+                "Background voice score complete (attempt %d). "
+                "session_id=%s question_id=%s phase=%s score=%d",
+                attempt, session_id, question_id, phase, final_score,
+            )
+
+            # Push notification (best-effort — don't let a push failure unwind the score)
+            try:
+                await send_voice_result_notification(session["user_id"], final_score, phase, db)
+            except Exception as notify_exc:
+                logger.warning("Voice result notification failed: %s", notify_exc)
+
+            return  # success — exit retry loop
+
+        except asyncio.TimeoutError as exc:
+            last_exc = exc
+            logger.warning(
+                "Background voice score timed out (attempt %d/%d, timeout=%ds). "
+                "session_id=%s question_id=%s",
+                attempt, len(_RETRY_DELAYS), _SCORE_TIMEOUT, session_id, question_id,
+            )
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Background voice score failed (attempt %d/%d): %s. "
+                "session_id=%s question_id=%s",
+                attempt, len(_RETRY_DELAYS), exc, session_id, question_id,
+            )
+
+    # All attempts exhausted — persist failure state for manual review
+    logger.error(
+        "Background voice score permanently failed after %d attempts. "
+        "session_id=%s question_id=%s last_error=%s",
+        len(_RETRY_DELAYS), session_id, question_id, last_exc,
+    )
+    try:
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.voice_score_status": "failed",
+                "answers.$.feedback": "Automatic scoring failed. Our team will review your submission manually.",
+                "answers.$.manual_review_status": "pending",
+            }},
+        )
+    except Exception as persist_exc:
+        logger.error("Failed to persist voice score failure state: %s", persist_exc)
+
+
+async def get_voice_score_status(
+    session_id: str,
+    user_id: str,
+    db: AsyncIOMotorDatabase,
+) -> list[dict]:
+    """Return async scoring status for every voice answer in the session."""
+    from bson import ObjectId
+    from bson.errors import InvalidId
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    results = []
+    for answer in session.get("answers", []):
+        if answer.get("answer_type") != "voice":
+            continue
+        if answer.get("voice_score_status") is None:
+            continue  # synchronously scored answers — no status tracking needed
+        status_val = answer.get("voice_score_status", "complete")
+        results.append({
+            "question_id": answer["question_id"],
+            "phase": answer.get("phase", "hr"),
+            "status": status_val,
+            "score": answer.get("score") if status_val == "complete" else None,
+            "feedback": answer.get("feedback") if status_val == "complete" else None,
+            "transcription": answer.get("transcription"),
+            "criteria_scores": answer.get("criteria_scores", {}) if status_val == "complete" else {},
+            "estimated_seconds": 0 if status_val == "complete" else 90,
+        })
+    return results
+
+
 def _phase_weights(present_phases: list[str]) -> dict[str, float]:
     """Weighted-average rule from the spec: HR 30% / Technical 50% /
     Behavioral 20% — and "if a phase is not in this session, redistribute its
@@ -524,16 +1218,43 @@ def _phase_weights(present_phases: list[str]) -> dict[str, float]:
     return {phase: _BASE_PHASE_WEIGHTS[phase] + bonus for phase in present_phases}
 
 
+# Fields that are large binary payloads kept in the answers array for scoring
+# but must never appear in any API response (or in phase_results stored to DB).
+_PRIVATE_ANSWER_FIELDS: frozenset[str] = frozenset({
+    "_voice_audio_base64",
+    "_voice_audio_format",
+    "_coding_image_base64",
+    "_coding_image_mime_type",
+})
+
+
+def _sanitize_phase_results(phase_results: list[dict]) -> list[dict]:
+    """Return a copy of phase_results with private binary fields stripped from
+    every answer.  Guards against old sessions stored before the stripping fix
+    and against the admin review path recomputing phase_results from the raw
+    answers array."""
+    sanitized = []
+    for phase in phase_results:
+        clean_answers = [
+            {k: v for k, v in answer.items() if k not in _PRIVATE_ANSWER_FIELDS}
+            for answer in phase.get("answers", [])
+        ]
+        sanitized.append({**phase, "answers": clean_answers})
+    return sanitized
+
+
 def to_session_result(session: dict) -> dict:
     """Project a completed session document down to the SessionResult shape
-    (also reused by GET /session/{id} and GET /history)."""
+    (also reused by GET /session/{id}, GET /history, and all admin routes).
+    Always strips private binary fields from phase_results answers so large
+    base64 blobs never appear in API responses."""
     return {
         "id": session["id"],
         "user_id": session["user_id"],
         "track_id": session["track_id"],
         "mode": session["mode"],
         "overall_score": session["overall_score"],
-        "phase_results": session["phase_results"],
+        "phase_results": _sanitize_phase_results(session.get("phase_results", [])),
         "started_at": session["started_at"],
         "completed_at": session["completed_at"],
         "duration_seconds": session["duration_seconds"],
@@ -569,7 +1290,22 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
     all_question_ids = {
         question["id"] for questions in questions_by_phase.values() for question in questions
     }
-    missing_ids = all_question_ids - set(answers_by_id.keys())
+    answered_ids = set(answers_by_id.keys())
+    # Coding_logic and voice answers with status "pending"/"processing" count as
+    # answered (async scoring is running in background); only truly missing answers block.
+    coding_pending_ids = {
+        answer["question_id"]
+        for answer in answers
+        if answer.get("phase") == "coding_logic"
+        and answer.get("coding_score_status") in ("pending", "processing")
+    }
+    voice_pending_ids = {
+        answer["question_id"]
+        for answer in answers
+        if answer.get("answer_type") == "voice"
+        and answer.get("voice_score_status") in ("pending", "processing")
+    }
+    missing_ids = all_question_ids - answered_ids - coding_pending_ids - voice_pending_ids
     if missing_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -579,10 +1315,27 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
     phase_results: list[dict] = []
     phase_scores: dict[str, int] = {}
 
+    # Private storage-only fields that must never appear in phase_results (or
+    # any API response).  They can be large base64 blobs (1-5 MB each) and will
+    # push the MongoDB document well past its 16 MB hard limit when there are
+    # multiple pending voice/coding answers at completion time.
+    _PRIVATE_ANSWER_FIELDS = frozenset({
+        "_voice_audio_base64",
+        "_voice_audio_format",
+        "_coding_image_base64",
+        "_coding_image_mime_type",
+    })
+
+    def _clean_answer(ans: dict) -> dict:
+        """Return a shallow copy of ans with all private storage fields removed."""
+        return {k: v for k, v in ans.items() if k not in _PRIVATE_ANSWER_FIELDS}
+
     for phase in session["phases"]:
         phase_questions = questions_by_phase[phase]
-        phase_answers = [answers_by_id[question["id"]] for question in phase_questions]
-        phase_score = round(sum(answer["score"] for answer in phase_answers) / len(phase_answers))
+        # Strip private binary blobs before embedding answers in phase_results.
+        phase_answers = [_clean_answer(answers_by_id[question["id"]]) for question in phase_questions]
+        # Pending voice/coding answers have score=0 or score=None; treat None as 0.
+        phase_score = round(sum((answer["score"] or 0) for answer in phase_answers) / len(phase_answers))
         phase_scores[phase] = phase_score
         phase_results.append({
             "phase": phase,

@@ -10,7 +10,7 @@ _settings = get_settings()
 
 _JSON_ONLY_SUFFIX = (
     "\n\nRespond ONLY with valid JSON. No markdown, no backticks, no preamble, "
-    "no explanation. Start immediately with `[`."
+    "no explanation. Start immediately with `{`."
 )
 _RETRY_SUFFIX = "\n\nYour previous response was not valid JSON. Output ONLY raw JSON this time."
 
@@ -93,17 +93,40 @@ def _build_question_prompt(
         f"{criteria}\n"
         "- model_answer: a concise ideal answer/rubric used only after submission\n"
         "- tags: 2-5 lowercase tags\n\n"
-        "Respond with a JSON array using exactly this schema:\n"
-        "[\n"
-        "  {\n"
-        '    "question_text": "...",\n'
-        '    "difficulty": "medium",\n'
-        '    "scoring_criteria": ["accuracy", "depth"],\n'
-        '    "model_answer": "...",\n'
-        '    "tags": ["technical", "api-design"]\n'
-        "  }\n"
-        "]" + _JSON_ONLY_SUFFIX
+        "Respond with a JSON object whose `questions` value is an array of "
+        f"exactly {count} question objects, using exactly this schema:\n"
+        "{\n"
+        '  "questions": [\n'
+        "    {\n"
+        '      "question_text": "...",\n'
+        '      "difficulty": "medium",\n'
+        '      "scoring_criteria": ["accuracy", "depth"],\n'
+        '      "model_answer": "...",\n'
+        '      "tags": ["technical", "api-design"]\n'
+        "    }\n"
+        "  ]\n"
+        "}" + _JSON_ONLY_SUFFIX
     )
+
+
+def _coerce_question_list(raw) -> list | None:
+    """Normalize the local model's response into a list of question dicts.
+
+    Ollama's JSON mode (`format=json`) reliably emits a single JSON *object*,
+    not a top-level array, so we ask for `{"questions": [...]}`. Be tolerant of
+    the small model's variations: a raw list, the wrapped list under a few
+    likely keys, or a single bare question object."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        for key in ("questions", "items", "data", "results"):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return value
+        # A single bare question object (model ignored the array wrapper).
+        if "question_text" in raw:
+            return [raw]
+    return None
 
 
 async def generate_question_documents(
@@ -114,8 +137,9 @@ async def generate_question_documents(
     guidance: str | None,
 ) -> list[dict]:
     prompt = _build_question_prompt(track, phase, count, difficulty, guidance)
-    raw_questions = await _call_ai_json(prompt)
-    if not isinstance(raw_questions, list):
+    raw = await _call_ai_json(prompt)
+    raw_questions = _coerce_question_list(raw)
+    if raw_questions is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="AI generation service returned an unexpected response.",

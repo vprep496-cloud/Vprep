@@ -1,10 +1,10 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSession } from "next-auth/react";
 import axios from "axios";
-import { AlertTriangle, Eye, Loader2, Pencil, Plus, Sparkles, Trash2 } from "lucide-react";
+import { AlertTriangle, Eye, Loader2, Pencil, Plus, Sparkles, Trash2, X } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import { PHASE_OPTIONS, TRACK_NAMES, TRACK_OPTIONS, type TrackOption } from "@/lib/tracks";
@@ -52,9 +52,9 @@ function DeleteQuestionDialog({
       onDeleted();
       onClose();
     } catch (err) {
-      // Agent Rule #5: `admin.py`'s DELETE checks whether this question has
-      // been used in any completed session and responds 400 rather than
-      // deleting — surface that explanation verbatim instead of a generic error.
+      // `admin.py`'s DELETE checks whether this question has been used in any
+      // completed session and responds 400 rather than deleting — surface that
+      // explanation verbatim instead of a generic message.
       const detail = axios.isAxiosError(err) ? err.response?.data?.detail : null;
       setError(typeof detail === "string" ? detail : "Something went wrong. Please try again.");
     } finally {
@@ -63,39 +63,72 @@ function DeleteQuestionDialog({
   };
 
   return (
-    <div style={{ minHeight: 500 }}>
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
-        <div className="w-full max-w-md rounded-2xl border border-border bg-background-card p-6 shadow-xl">
-          <h2 className="text-lg font-bold text-text-primary">Delete Question</h2>
-          <p className="mt-2 text-sm text-text-secondary">
-            This permanently removes &ldquo;{question.questionText.slice(0, 96)}
-            {question.questionText.length > 96 ? "…" : ""}&rdquo; from the question bank.
-          </p>
-          <p className="mt-3 rounded-xl bg-warning/10 px-3 py-2.5 text-sm text-warning">
-            This cannot be undone. Questions already used in a completed interview can&apos;t be deleted.
-          </p>
-
-          {error ? <p className="mt-3 text-sm text-danger">{error}</p> : null}
-
-          <div className="mt-6 flex justify-end gap-3">
-            <button
-              type="button"
-              onClick={onClose}
-              disabled={isSubmitting}
-              className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={handleDelete}
-              disabled={isSubmitting}
-              className="flex items-center gap-2 rounded-xl bg-danger px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-danger/90 disabled:opacity-50"
-            >
-              {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={15} />}
-              Delete
-            </button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+      <div className="w-full max-w-md rounded-2xl border border-border bg-background-card shadow-xl">
+        {/* Header */}
+        <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-5">
+          <div className="flex items-center gap-2.5">
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-danger/10">
+              <Trash2 size={16} className="text-danger" />
+            </div>
+            <div>
+              <h2 className="text-base font-bold text-text-primary">Delete Question</h2>
+              <p className="text-xs text-text-muted">This action is permanent</p>
+            </div>
           </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isSubmitting}
+            className="rounded-lg p-1.5 text-text-muted transition-colors hover:bg-background-surface hover:text-text-primary disabled:opacity-50"
+            aria-label="Close"
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="px-6 py-5">
+          <p className="text-sm text-text-secondary">
+            This permanently removes{" "}
+            <span className="font-semibold text-text-primary">
+              &ldquo;{question.questionText.slice(0, 96)}{question.questionText.length > 96 ? "…" : ""}&rdquo;
+            </span>{" "}
+            from the question bank.
+          </p>
+          <div className="mt-4 flex items-start gap-2.5 rounded-xl border border-warning/25 bg-warning/10 px-4 py-3">
+            <div className="mt-0.5 h-2 w-2 shrink-0 rounded-full bg-warning" />
+            <p className="text-sm text-warning">
+              This cannot be undone. Questions already used in a completed interview can&apos;t be deleted.
+            </p>
+          </div>
+          {error ? (
+            <div className="mt-3 flex items-center gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
+              <div className="h-2 w-2 shrink-0 rounded-full bg-danger" />
+              <p className="text-sm text-danger">{error}</p>
+            </div>
+          ) : null}
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isSubmitting}
+            className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={handleDelete}
+            disabled={isSubmitting}
+            className="flex items-center gap-2 rounded-xl bg-danger px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-danger/90 disabled:opacity-50"
+          >
+            {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Trash2 size={16} />}
+            Delete
+          </button>
         </div>
       </div>
     </div>
@@ -121,8 +154,10 @@ export default function QuestionsPage() {
   const [editingQuestion, setEditingQuestion] = useState<AdminQuestion | null>(null);
   const [deletingQuestion, setDeletingQuestion] = useState<AdminQuestion | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [successBanner, setSuccessBanner] = useState<string | null>(null);
+  const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["admin-questions", { page, phaseFilter, trackFilter }],
     queryFn: () =>
       adminApi.getQuestions({
@@ -131,10 +166,12 @@ export default function QuestionsPage() {
         phase: phaseFilter !== "all" ? phaseFilter : undefined,
         trackId: trackFilter !== "all" ? trackFilter : undefined,
       }),
+    retry: 1,
   });
   const { data: tracks } = useQuery({
     queryKey: ["admin-tracks"],
     queryFn: adminApi.getTracks,
+    retry: 1,
   });
 
   const questions = useMemo(() => data?.items ?? [], [data]);
@@ -158,7 +195,16 @@ export default function QuestionsPage() {
     [trackOptions]
   );
 
+  // Clear the success-banner timeout on unmount to prevent setState on unmounted component.
+  useEffect(() => () => { if (successTimerRef.current) clearTimeout(successTimerRef.current); }, []);
+
   const invalidate = () => queryClient.invalidateQueries({ queryKey: ["admin-questions"] });
+
+  const showSuccess = (message: string) => {
+    if (successTimerRef.current) clearTimeout(successTimerRef.current);
+    setSuccessBanner(message);
+    successTimerRef.current = setTimeout(() => setSuccessBanner(null), 4000);
+  };
 
   const columns: DataTableColumn<AdminQuestion>[] = [
     {
@@ -273,6 +319,14 @@ export default function QuestionsPage() {
         }
       />
 
+      {/* Success banner — shown after generate or add completes. Auto-dismisses after 4s. */}
+      {successBanner ? (
+        <div className="mt-4 flex items-center gap-3 rounded-xl border border-success/30 bg-success/10 px-4 py-3">
+          <span className="h-2 w-2 rounded-full bg-success" />
+          <p className="text-sm font-medium text-success">{successBanner}</p>
+        </div>
+      ) : null}
+
       {/* Phase 7 spec: "View Only" banner for non-superadmin admins — use an
           amber info banner at the TOP of the page (not just a badge in the
           header) so it's unmissable. Kept outside PageHeader so it sits flush
@@ -323,7 +377,7 @@ export default function QuestionsPage() {
       </div>
 
       <div className="mt-6">
-        <DataTable columns={columns} data={questions} loading={isLoading} emptyMessage="No questions match your filters" />
+        <DataTable columns={columns} data={questions} loading={isLoading} error={isError} onRetry={() => refetch()} emptyMessage="No questions match your filters" />
       </div>
 
       <div className="mt-4 flex items-center justify-between text-sm text-text-secondary">
@@ -358,7 +412,7 @@ export default function QuestionsPage() {
         <AddQuestionModal
           isOpen={isAddOpen}
           onClose={() => setIsAddOpen(false)}
-          onSuccess={invalidate}
+          onSuccess={() => { invalidate(); showSuccess("Question added to the bank."); }}
           trackOptions={trackOptions}
         />
       ) : null}
@@ -366,7 +420,7 @@ export default function QuestionsPage() {
         <GenerateQuestionsModal
           isOpen={isGenerateOpen}
           onClose={() => setIsGenerateOpen(false)}
-          onSuccess={() => invalidate()}
+          onSuccess={(count) => { invalidate(); showSuccess(`${count} question${count === 1 ? "" : "s"} generated and saved to the bank.`); }}
           trackOptions={trackOptions}
         />
       ) : null}

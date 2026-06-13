@@ -145,6 +145,10 @@ export interface InterviewQuestionAnswer {
   reviewerNotes?: string | null;
   reviewedBy?: string | null;
   reviewedAt?: string | null;
+  /** Async coding score lifecycle — populated only for coding_logic answers */
+  codingScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
+  /** Async voice score lifecycle — populated only for async-scored voice answers */
+  voiceScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
 }
 
 export interface InterviewPhaseResult {

@@ -23,18 +23,20 @@ function StatusPill({ ok, label }: { ok: boolean; label: string }) {
 
 function SettingRow({ label, value }: { label: string; value: string | number | null }) {
   return (
-    <div className="flex items-center justify-between gap-4 border-b border-border py-3 last:border-0">
+    <div className="flex items-center justify-between gap-4 border-b border-border-soft py-3 last:border-0">
       <span className="text-sm text-text-secondary">{label}</span>
-      <span className="max-w-md truncate text-sm font-semibold text-text-primary">{value ?? "Not set"}</span>
+      <span className="max-w-[60%] truncate text-sm font-semibold text-text-primary">{value ?? "—"}</span>
     </div>
   );
 }
 
 function ModelsPanel({ status }: { status: AIStatus }) {
   return (
-    <div className="rounded-2xl border border-border bg-background-card p-5">
-      <div className="flex items-center gap-2">
-        <Sparkles size={18} className="text-primary-400" />
+    <div className="rounded-2xl border border-border-soft bg-background-card p-5 shadow-soft">
+      <div className="flex items-center gap-2.5">
+        <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-500/10">
+          <Sparkles size={15} className="text-primary-600" />
+        </div>
         <h2 className="text-base font-bold text-text-primary">Model Routing</h2>
       </div>
       <div className="mt-3">
@@ -92,10 +94,12 @@ export default function AIPage() {
         </div>
       ) : (
         <div className="mt-6 grid grid-cols-1 gap-5 xl:grid-cols-2">
-          <div className="rounded-2xl border border-border bg-background-card p-5">
+          <div className="rounded-2xl border border-border-soft bg-background-card p-5 shadow-soft">
             <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2">
-                <KeyRound size={18} className="text-primary-400" />
+              <div className="flex items-center gap-2.5">
+                <div className="flex h-8 w-8 items-center justify-center rounded-lg bg-primary-500/10">
+                  <KeyRound size={15} className="text-primary-600" />
+                </div>
                 <h2 className="text-base font-bold text-text-primary">Provider</h2>
               </div>
               <StatusPill ok={current.configured} label={current.configured ? "Configured" : "Needs setup"} />
@@ -114,15 +118,16 @@ export default function AIPage() {
             </div>
 
             {current.live ? (
-              <div className="mt-4 rounded-xl border border-border bg-background-surface px-4 py-3">
+              <div className="mt-4 rounded-xl border border-border-soft bg-background-elevated px-4 py-3.5">
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm font-semibold text-text-primary">Live check</span>
+                  <span className="text-sm font-semibold text-text-primary">Live check result</span>
                   <StatusPill ok={current.live.ok} label={current.live.ok ? "Passed" : "Failed"} />
                 </div>
                 <p className="mt-2 text-sm text-text-secondary">{current.live.message}</p>
                 {current.live.availableModels?.length ? (
-                  <p className="mt-1 text-xs text-text-muted">
-                    Available models: {current.live.availableModels.join(", ")}
+                  <p className="mt-2 text-xs text-text-muted">
+                    Available models:{" "}
+                    <span className="font-medium text-text-secondary">{current.live.availableModels.join(", ")}</span>
                   </p>
                 ) : null}
               </div>

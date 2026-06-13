@@ -26,6 +26,20 @@ class EnrollmentCreate(BaseModel):
     """
 
     track_id: str
+    # Optional per-track target role. Each track keeps its own role (an ML
+    # candidate prepping for "MLOps Engineer" vs "AI Engineer"), so this lives
+    # on the enrollment rather than globally on the user. Prefer `target_role_id`
+    # (a predefined catalog role for the track); `target_role` carries a free
+    # custom label. When both are omitted the backend derives a default.
+    target_role_id: str | None = None
+    target_role: str | None = None
+
+
+class EnrollmentTargetRoleUpdate(BaseModel):
+    """Request body for PUT /tracks/enrollment/{track_id}/target-role."""
+
+    target_role_id: str | None = None
+    target_role: str | None = None
 
 
 class Enrollment(BaseModel):
@@ -35,6 +49,14 @@ class Enrollment(BaseModel):
     user_id: str
     track_id: TrackId
     skill_level: SkillLevel
+    target_role: str | None = None
+    target_role_id: str | None = None
+    # Seniority of the chosen role (junior | mid | senior) — blended with the
+    # candidate's skill level to set question difficulty.
+    role_seniority: str | None = None
+    # False while the role is still the system-derived default; True once the
+    # candidate explicitly picks one. Lets the UI nudge them to confirm.
+    role_confirmed: bool = False
     start_date: datetime
     current_day: int
     completed_topics: list[str] = []
@@ -56,8 +78,29 @@ class EnrollmentProgress(BaseModel):
     session_score: float | None = None
 
 
+class EnrollmentSkillLevelUpdate(BaseModel):
+    """Request body for PATCH /tracks/enrollment/{track_id}/skill-level."""
+
+    skill_level: SkillLevel
+
+
 class EnrollmentResponse(Enrollment):
     """Enrollment enriched with the static track catalog entry and plan status."""
 
     track: Track
     plan_exists: bool
+
+
+class TrackStats(BaseModel):
+    """Aggregated statistics for one enrollment, returned by GET /enrollment/{track_id}/stats."""
+
+    track_id: str
+    skill_level: SkillLevel
+    current_day: int
+    total_sessions: int
+    average_score: float
+    best_score: float
+    worst_score: float
+    completed_topics_count: int
+    days_since_enrollment: int
+    total_practice_time_seconds: int

@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import axios from "axios";
-import { Loader2 } from "lucide-react";
+import { Loader2, PlusCircle, X } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import { ANSWER_TYPE_BY_PHASE, DIFFICULTY_OPTIONS, PHASE_OPTIONS, type TrackOption } from "@/lib/tracks";
@@ -55,17 +55,15 @@ function csvToList(value: string): string[] {
 
 // Phase 6 — superadmin-only "Add Question" form (Agent Rule #7: this modal is
 // only ever mounted from `questions/page.tsx` behind a
-// `session.user.role === "superadmin"` check — ​not rendered-but-disabled for
+// `session.user.role === "superadmin"` check — not rendered-but-disabled for
 // plain admins). Mirrors `PromoteUserModal`'s overlay/loading/error shape.
 //
 // Judgment call: `answer_type` is intentionally NOT a field here. `admin.py`'s
-// `_validate_question_fields` (Agent Rule #3 route, but its own 400 logic)
-// hard-requires `answer_type` to match a fixed mapping per `phase` — voice for
-// HR/Behavioral, text for Technical — and rejects any mismatch. Rather than
-// expose a control whose only valid value is dictated by another field
-// (and which a 400 would then bounce back), the form derives it from `phase`
-// via `ANSWER_TYPE_BY_PHASE` (the same map `admin.py` validates against) and
-// surfaces it as a read-only badge for transparency.
+// `_validate_question_fields` hard-requires `answer_type` to match a fixed
+// mapping per `phase` — voice for HR/Behavioral, text for Technical — and
+// rejects any mismatch. Rather than expose a control whose only valid value is
+// dictated by another field, the form derives it from `phase` via
+// `ANSWER_TYPE_BY_PHASE` and surfaces it as a read-only badge.
 export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOptions }: AddQuestionModalProps) {
   const [form, setForm] = useState<FormState>(EMPTY_FORM);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -76,6 +74,13 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
   };
 
   const derivedAnswerType = form.phase ? ANSWER_TYPE_BY_PHASE[form.phase] : null;
+
+  // HR and Behavioral questions can be shared across all tracks (track_id = "all").
+  // Technical and Coding Logic questions must belong to a specific track.
+  const allowsAllTrack = form.phase === "hr" || form.phase === "behavioral";
+  const filteredTrackOptions = trackOptions.filter(
+    (track) => track.id !== "all" || allowsAllTrack
+  );
 
   const isValid =
     form.trackId !== "" &&
@@ -123,19 +128,37 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
     }
   };
 
-  // Same stable-height wrapper trick `PromoteUserModal` uses — keeps the
-  // surrounding layout from jumping when the fixed-position overlay mounts.
-  return (
-    <div style={{ minHeight: 500 }}>
-      {isOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/50 backdrop-blur-sm p-4">
-          <div className="w-full max-w-xl rounded-2xl border border-border bg-background-card p-6 shadow-xl">
-            <h2 className="text-lg font-bold text-text-primary">Add Question</h2>
-            <p className="mt-1 text-sm text-text-secondary">
-              Add a new question to the bank. Candidates may encounter it in future mock interviews.
-            </p>
+  if (!isOpen) return null;
 
-            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+  return (
+    <>
+      <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 backdrop-blur-sm p-4">
+        <div className="w-full max-w-xl rounded-2xl border border-border bg-background-card shadow-xl">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary-500/10">
+                <PlusCircle size={16} className="text-primary-600" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-text-primary">Add Question</h2>
+                <p className="text-xs text-text-muted">Add a new question to the interview bank</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={isSubmitting}
+              className="rounded-lg p-1.5 text-text-muted transition-colors hover:bg-background-surface hover:text-text-primary disabled:opacity-50"
+              aria-label="Close"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          {/* Body */}
+          <div className="max-h-[70vh] overflow-y-auto px-6 py-5">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <label className={LABEL_CLASS}>
                 Track
                 <select
@@ -146,7 +169,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
                   <option value="" disabled>
                     Select a track
                   </option>
-                  {trackOptions.map((track) => (
+                  {filteredTrackOptions.map((track) => (
                     <option key={track.id} value={track.id}>
                       {track.name}
                     </option>
@@ -174,7 +197,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
             </div>
 
             {derivedAnswerType ? (
-              <p className="mt-3 text-xs text-text-muted">
+              <p className="mt-3 rounded-lg bg-background-surface px-3 py-2 text-xs text-text-muted">
                 Answer type for this phase is fixed:{" "}
                 <span className="font-semibold text-text-secondary">
                   {derivedAnswerType === "voice"
@@ -227,7 +250,8 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
             </label>
 
             <label className={`${LABEL_CLASS} mt-4`}>
-              Model Answer <span className="text-text-muted">(the rubric local AI scores against — never shown to candidates up front)</span>
+              Model Answer{" "}
+              <span className="text-text-muted">(rubric the AI scores against — never shown to candidates)</span>
               <textarea
                 value={form.modelAnswer}
                 onChange={(event) => update("modelAnswer", event.target.value)}
@@ -247,30 +271,36 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
               />
             </label>
 
-            {error ? <p className="mt-4 text-sm text-danger">{error}</p> : null}
+            {error ? (
+              <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
+                <div className="h-2 w-2 shrink-0 rounded-full bg-danger" />
+                <p className="text-sm text-danger">{error}</p>
+              </div>
+            ) : null}
+          </div>
 
-            <div className="mt-6 flex justify-end gap-3">
-              <button
-                type="button"
-                onClick={handleClose}
-                disabled={isSubmitting}
-                className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSubmit}
-                disabled={isSubmitting || !isValid}
-                className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
-              >
-                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
-                Add Question
-              </button>
-            </div>
+          {/* Footer */}
+          <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={isSubmitting}
+              className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={isSubmitting || !isValid}
+              className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
+            >
+              {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <PlusCircle size={16} />}
+              Add Question
+            </button>
           </div>
         </div>
-      ) : null}
-    </div>
+      </div>
+    </>
   );
 }

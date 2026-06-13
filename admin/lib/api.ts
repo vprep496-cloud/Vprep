@@ -1,5 +1,4 @@
 import axios from "axios";
-import { getSession } from "next-auth/react";
 import type {
   AdminAnalytics,
   AIStatus,
@@ -31,14 +30,40 @@ const api = axios.create({
   },
 });
 
-// Attach the NextAuth session's backend access token to every request.
-api.interceptors.request.use(async (config) => {
-  const session = await getSession();
-  if (session?.accessToken) {
-    config.headers.Authorization = `Bearer ${session.accessToken}`;
+// ---------------------------------------------------------------------------
+// Synchronous token store — avoids the previous pattern of calling
+// `getSession()` (which makes an extra HTTP round-trip to /api/auth/session)
+// inside the request interceptor for every single API call.
+//
+// DashboardShell (the top-level authenticated layout) calls `setApiToken`
+// immediately on mount and whenever the NextAuth session changes, so the
+// token is always available synchronously by the time any child component's
+// React Query hook fires its first request.
+// ---------------------------------------------------------------------------
+let _authToken: string | null = null;
+
+export function setApiToken(token: string | null): void {
+  _authToken = token;
+}
+
+// Synchronous interceptor — zero extra round-trips per request.
+api.interceptors.request.use((config) => {
+  if (_authToken) {
+    config.headers.Authorization = `Bearer ${_authToken}`;
   }
   return config;
 });
+
+// Global 401/403 handler — clears stale token and lets the layout redirect.
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (axios.isAxiosError(error) && (error.response?.status === 401 || error.response?.status === 403)) {
+      _authToken = null;
+    }
+    return Promise.reject(error);
+  }
+);
 
 export default api;
 
@@ -185,6 +210,8 @@ interface BackendQuestionAnswer {
   reviewer_notes?: string | null;
   reviewed_by?: string | null;
   reviewed_at?: string | null;
+  voice_score_status?: "pending" | "processing" | "complete" | "failed" | null;
+  coding_score_status?: "pending" | "processing" | "complete" | "failed" | null;
 }
 
 interface BackendPhaseResult {
@@ -366,8 +393,8 @@ function toCandidateAssessment(assessment: BackendCandidateAssessment): Candidat
     trackId: assessment.track_id as CandidateAssessment["trackId"],
     skillLevel: assessment.skill_level,
     score: assessment.score,
-    breakdown: assessment.breakdown,
-    perQuestionFeedback: assessment.per_question_feedback.map(toQuestionFeedback),
+    breakdown: assessment.breakdown ?? {},
+    perQuestionFeedback: (assessment.per_question_feedback ?? []).map(toQuestionFeedback),
     scoringVersion: assessment.scoring_version ?? null,
     createdAt: assessment.created_at,
   };
@@ -383,7 +410,7 @@ function toQuestionAnswer(answer: BackendQuestionAnswer): InterviewQuestionAnswe
     userTextAnswer: answer.user_text_answer,
     answerDurationSeconds: answer.answer_duration_seconds ?? null,
     score: answer.score,
-    criteriaScores: answer.criteria_scores,
+    criteriaScores: answer.criteria_scores ?? {},
     feedback: answer.feedback,
     modelAnswer: answer.model_answer,
     confidence: answer.confidence ?? null,
@@ -405,6 +432,8 @@ function toQuestionAnswer(answer: BackendQuestionAnswer): InterviewQuestionAnswe
     reviewerNotes: answer.reviewer_notes ?? null,
     reviewedBy: answer.reviewed_by ?? null,
     reviewedAt: answer.reviewed_at ?? null,
+    voiceScoreStatus: answer.voice_score_status ?? null,
+    codingScoreStatus: answer.coding_score_status ?? null,
   };
 }
 
@@ -424,7 +453,7 @@ function toSessionResult(result: BackendSessionResult): InterviewSessionResult {
     trackId: result.track_id as InterviewSessionResult["trackId"],
     mode: result.mode,
     overallScore: result.overall_score,
-    phaseResults: result.phase_results.map(toPhaseResult),
+    phaseResults: (result.phase_results ?? []).map(toPhaseResult),
     startedAt: result.started_at,
     completedAt: result.completed_at,
     durationSeconds: result.duration_seconds,
@@ -439,9 +468,9 @@ function toAdminQuestion(question: BackendQuestion): AdminQuestion {
     questionText: question.question_text,
     answerType: question.answer_type,
     difficulty: question.difficulty,
-    scoringCriteria: question.scoring_criteria,
+    scoringCriteria: question.scoring_criteria ?? [],
     modelAnswer: question.model_answer,
-    tags: question.tags,
+    tags: question.tags ?? [],
     createdAt: question.created_at,
     updatedAt: question.updated_at,
   };
@@ -587,7 +616,7 @@ export const adminApi = {
 
   async getTracks(): Promise<TrackSummary[]> {
     const { data } = await api.get<BackendTracksResponse>("/api/v1/admin/tracks");
-    return data.tracks.map((track) => toTrackSummary(track)).filter(Boolean) as TrackSummary[];
+    return (data.tracks ?? []).map((track) => toTrackSummary(track)).filter(Boolean) as TrackSummary[];
   },
 
   async createTrack(input: TrackInput): Promise<TrackSummary> {
@@ -682,9 +711,13 @@ export const adminApi = {
   },
 
   async generateQuestions(input: QuestionGenerateInput): Promise<AdminQuestion[]> {
+    // Local LLM generation (Ollama/llama3.2:3b) of a whole batch can run well
+    // past the default 20s axios timeout — give it the same headroom the
+    // mobile app gives answer scoring rather than failing with a timeout.
     const { data } = await api.post<BackendGeneratedQuestionsResponse>(
       "/api/v1/admin/questions/generate",
-      questionGenerateToPayload(input)
+      questionGenerateToPayload(input),
+      { timeout: 120000 }
     );
     return data.questions.map(toAdminQuestion);
   },
@@ -709,9 +742,9 @@ export const adminApi = {
       },
     });
     return {
-      scoreTrend: data.score_trend.map(toScoreTrendPoint),
-      trackDistribution: data.track_distribution.map(toTrackDistributionPoint),
-      sessionCompletion: data.session_completion,
+      scoreTrend: (data.score_trend ?? []).map(toScoreTrendPoint),
+      trackDistribution: (data.track_distribution ?? []).map(toTrackDistributionPoint),
+      sessionCompletion: data.session_completion ?? [],
     };
   },
 

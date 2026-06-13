@@ -2,7 +2,7 @@
 
 import { useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Activity, BarChart3, TrendingUp } from "lucide-react";
+import { Activity, BarChart3, RefreshCw, TrendingUp } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import PageHeader from "@/components/ui/PageHeader";
@@ -69,13 +69,15 @@ export default function AnalyticsPage() {
   const [days, setDays] = useState(30);
   const [trackFilter, setTrackFilter] = useState<string>("all");
 
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, isError, refetch } = useQuery({
     queryKey: ["admin-analytics", { days, trackFilter }],
     queryFn: () => adminApi.getAnalytics({ days, trackId: trackFilter !== "all" ? trackFilter : undefined }),
+    retry: 1,
   });
   const { data: tracks } = useQuery({
     queryKey: ["admin-tracks"],
     queryFn: adminApi.getTracks,
+    retry: 1,
   });
 
   return (
@@ -115,6 +117,23 @@ export default function AnalyticsPage() {
           </div>
         }
       />
+
+      {isError && (
+        <div className="mt-6 flex items-center justify-between gap-4 rounded-2xl border border-danger/20 bg-danger/5 px-5 py-4">
+          <p className="text-sm text-danger">
+            <span className="font-semibold">Error loading analytics.</span>{" "}
+            Make sure the backend is running and you&apos;re logged in.
+          </p>
+          <button
+            type="button"
+            onClick={() => refetch()}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-danger/30 px-3 py-1.5 text-xs font-semibold text-danger transition-colors hover:bg-danger/10"
+          >
+            <RefreshCw size={13} />
+            Retry
+          </button>
+        </div>
+      )}
 
       <div className="mt-6 grid grid-cols-1 gap-5 xl:grid-cols-2">
         <ChartSection

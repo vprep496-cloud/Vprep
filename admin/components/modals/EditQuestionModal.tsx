@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import axios from "axios";
-import { Loader2 } from "lucide-react";
+import { Loader2, Pencil, Save, X } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import { ANSWER_TYPE_BY_PHASE, DIFFICULTY_OPTIONS, PHASE_OPTIONS, type TrackOption } from "@/lib/tracks";
@@ -61,14 +61,12 @@ function toFormState(question: AdminQuestion): FormState {
 // judgment call — see that file's comment for the full rationale), but kept
 // as its own component per the spec's file tree rather than parameterizing
 // one shared modal: the two have different lifecycles (uncontrolled blank
-// form vs. an externally-supplied `question` to seed from and diff against)
-// and ​Agent Rule #2 only asked for these two file *targets*, not an
-// internal refactor of how they're composed.
+// form vs. an externally-supplied `question` to seed from and diff against).
 //
 // Sends only the fields that changed — `admin.py`'s `PUT /questions/{id}`
 // uses `payload.model_dump(exclude_none=True)` and re-validates the
 // *resulting* phase/answer_type combination, so a partial diff is exactly
-// what it expects (and keeps `updated_at` semantics meaningful).
+// what it expects.
 export default function EditQuestionModal({ question, isOpen, onClose, onSuccess, trackOptions }: EditQuestionModalProps) {
   const [form, setForm] = useState<FormState>(() => toFormState(question));
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -125,17 +123,37 @@ export default function EditQuestionModal({ question, isOpen, onClose, onSuccess
     }
   };
 
-  return (
-    <div style={{ minHeight: 500 }}>
-      {isOpen ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/50 backdrop-blur-sm p-4">
-          <div className="w-full max-w-xl rounded-2xl border border-border bg-background-card p-6 shadow-xl">
-            <h2 className="text-lg font-bold text-text-primary">Edit Question</h2>
-            <p className="mt-1 text-sm text-text-secondary">
-              Update this question's content, rubric, or classification.
-            </p>
+  if (!isOpen) return null;
 
-            <div className="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
+  return (
+    <>
+      <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-black/60 backdrop-blur-sm p-4">
+        <div className="w-full max-w-xl rounded-2xl border border-border bg-background-card shadow-xl">
+          {/* Header */}
+          <div className="flex items-start justify-between gap-4 border-b border-border px-6 py-5">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-primary-500/10">
+                <Pencil size={15} className="text-primary-600" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-text-primary">Edit Question</h2>
+                <p className="text-xs text-text-muted">Update content, rubric, or classification</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={isSubmitting}
+              className="rounded-lg p-1.5 text-text-muted transition-colors hover:bg-background-surface hover:text-text-primary disabled:opacity-50"
+              aria-label="Close"
+            >
+              <X size={16} />
+            </button>
+          </div>
+
+          {/* Body */}
+          <div className="max-h-[70vh] overflow-y-auto px-6 py-5">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <label className={LABEL_CLASS}>
                 Track
                 <select
@@ -168,7 +186,7 @@ export default function EditQuestionModal({ question, isOpen, onClose, onSuccess
             </div>
 
             {derivedAnswerType ? (
-              <p className="mt-3 text-xs text-text-muted">
+              <p className="mt-3 rounded-lg bg-background-surface px-3 py-2 text-xs text-text-muted">
                 Answer type for this phase is fixed:{" "}
                 <span className="font-semibold text-text-secondary">
                   {derivedAnswerType === "voice"
@@ -180,7 +198,8 @@ export default function EditQuestionModal({ question, isOpen, onClose, onSuccess
                 {derivedAnswerType !== question.answerType ? (
                   <span className="text-warning">
                     {" "}
-                    — changing from {question.answerType === "voice" ? "voice" : question.answerType === "image" ? "image" : "typed"}
+                    — changing from{" "}
+                    {question.answerType === "voice" ? "voice" : question.answerType === "image" ? "image" : "typed"}
                   </span>
                 ) : null}
               </p>
@@ -241,30 +260,36 @@ export default function EditQuestionModal({ question, isOpen, onClose, onSuccess
               />
             </label>
 
-            {error ? <p className="mt-4 text-sm text-danger">{error}</p> : null}
+            {error ? (
+              <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
+                <div className="h-2 w-2 shrink-0 rounded-full bg-danger" />
+                <p className="text-sm text-danger">{error}</p>
+              </div>
+            ) : null}
+          </div>
 
-            <div className="mt-6 flex justify-end gap-3">
-              <button
-                type="button"
-                onClick={handleClose}
-                disabled={isSubmitting}
-                className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={handleSubmit}
-                disabled={isSubmitting || !isValid}
-                className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
-              >
-                {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : null}
-                Save Changes
-              </button>
-            </div>
+          {/* Footer */}
+          <div className="flex justify-end gap-3 border-t border-border px-6 py-4">
+            <button
+              type="button"
+              onClick={handleClose}
+              disabled={isSubmitting}
+              className="rounded-xl border border-border px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:bg-background-surface disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleSubmit}
+              disabled={isSubmitting || !isValid}
+              className="flex items-center gap-2 rounded-xl bg-primary-500 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-primary-600 disabled:opacity-50"
+            >
+              {isSubmitting ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
+              Save Changes
+            </button>
           </div>
         </div>
-      ) : null}
-    </div>
+      </div>
+    </>
   );
 }

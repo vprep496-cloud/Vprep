@@ -4,7 +4,12 @@ from motor.motor_asyncio import AsyncIOMotorDatabase
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 # --- Phase 4: enrollment additions ---
-from app.models.enrollment import EnrollmentCreate, EnrollmentProgress
+from app.models.enrollment import (
+    EnrollmentCreate,
+    EnrollmentProgress,
+    EnrollmentSkillLevelUpdate,
+    EnrollmentTargetRoleUpdate,
+)
 from app.services import enrollment_service
 # --- end Phase 4 imports ---
 
@@ -135,6 +140,10 @@ DEFAULT_TRACKS: list[dict] = [
 TRACKS = DEFAULT_TRACKS
 TRACKS_BY_ID: dict[str, dict] = {track["id"]: track for track in DEFAULT_TRACKS}
 
+# The curated, per-track target-role catalog (with seniority + focus areas)
+# lives in app/services/role_catalog.py — the single source of truth used by
+# the enrollment service, interview personalization, and the /roles endpoint.
+
 
 def _serialize_track(document: dict) -> dict:
     track = {key: value for key, value in document.items() if key != "_id"}
@@ -198,7 +207,13 @@ async def enroll_in_track(
     if await get_track_or_none(payload.track_id, db) is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
 
-    enrollment = await enrollment_service.enroll(current_user["id"], payload.track_id, db)
+    enrollment = await enrollment_service.enroll(
+        current_user["id"],
+        payload.track_id,
+        db,
+        target_role=payload.target_role,
+        target_role_id=payload.target_role_id,
+    )
     return {"enrollment": enrollment, "message": "Enrolled successfully."}
 
 
@@ -245,6 +260,29 @@ async def update_enrollment_progress(
     return {"enrollment": enrollment}
 
 
+@router.put("/enrollment/{track_id}/target-role")
+async def update_enrollment_target_role(
+    track_id: str,
+    payload: EnrollmentTargetRoleUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Set the per-track target role for the current user's enrollment.
+
+    Each track keeps its own role so interview questions and plans personalize
+    to the role the candidate is actually targeting on that track. Clearing the
+    role re-derives the track's intelligent default.
+    """
+    enrollment = await enrollment_service.update_target_role(
+        current_user["id"],
+        track_id,
+        db,
+        target_role=payload.target_role,
+        target_role_id=payload.target_role_id,
+    )
+    return {"enrollment": enrollment}
+
+
 @router.delete("/enrollment/{track_id}")
 async def unenroll_from_track(
     track_id: str,
@@ -256,7 +294,88 @@ async def unenroll_from_track(
     return {"message": "Unenrolled successfully"}
 
 
+@router.post("/enrollment/{track_id}/reset")
+async def reset_enrollment_progress(
+    track_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Reset the enrollment's progress counters to their initial values.
+
+    Clears current_day (→ 1), completed_topics (→ []), average_score (→ 0),
+    and total_sessions (→ 0). The enrollment itself and all session history
+    in the sessions collection are preserved — the candidate stays enrolled
+    and their past work remains visible in the Progress screen.
+    """
+    enrollment = await enrollment_service.reset_progress(current_user["id"], track_id, db)
+    return {"enrollment": enrollment, "message": "Progress reset successfully."}
+
+
+@router.patch("/enrollment/{track_id}/skill-level")
+async def update_enrollment_skill_level(
+    track_id: str,
+    payload: EnrollmentSkillLevelUpdate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Override the skill level recorded on an enrollment.
+
+    Lets the candidate self-correct after an assessment mis-calibration or
+    choose a harder / softer difficulty without re-taking the assessment.
+    Only the enrollment record is updated; the assessments collection is
+    left untouched.
+    """
+    enrollment = await enrollment_service.update_skill_level(
+        current_user["id"], track_id, payload.skill_level.value, db
+    )
+    return {"enrollment": enrollment, "message": "Skill level updated."}
+
+
+@router.get("/enrollment/{track_id}/stats")
+async def get_enrollment_stats(
+    track_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Return aggregated performance statistics for one track enrollment.
+
+    Scans the sessions collection to compute session count, best/worst scores,
+    and total practice time — data that supplements the live enrollment fields
+    (current_day, average_score, total_sessions) shown in the Track Management
+    sheet.
+    """
+    stats = await enrollment_service.get_track_stats(current_user["id"], track_id, db)
+    return {"stats": stats}
+
+
 # --- end Phase 4 enrollment routes ---
+
+
+@router.get("/{track_id}/roles")
+async def get_track_roles(
+    track_id: str,
+    _current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Return the curated target roles for a track (each with a seniority level
+    and focus areas), so the candidate can choose what they're preparing for."""
+    from app.services.role_catalog import roles_for_track, seniority_label
+
+    track = await get_track_or_none(track_id, db)
+    if track is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Track not found.")
+
+    roles = [
+        {
+            "id": role["id"],
+            "label": role["label"],
+            "seniority": role["seniority"],
+            "seniority_label": seniority_label(role["seniority"]),
+            "focus": role["focus"],
+        }
+        for role in roles_for_track(track)
+    ]
+    return {"track_id": track_id, "roles": roles}
 
 
 @router.get("/{track_id}")

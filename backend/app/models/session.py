@@ -50,6 +50,10 @@ class QuestionAnswer(BaseModel):
     reviewer_notes: str | None = None
     reviewed_by: str | None = None
     reviewed_at: datetime | None = None
+    # Async coding score lifecycle: "pending" → "processing" → "complete" | "failed"
+    coding_score_status: Literal["pending", "processing", "complete", "failed"] | None = None
+    # Async voice score lifecycle: "pending" → "processing" → "complete" | "failed"
+    voice_score_status: Literal["pending", "processing", "complete", "failed"] | None = None
 
 
 class PhaseResult(BaseModel):
@@ -66,6 +70,65 @@ class SessionCreate(BaseModel):
     # `interview_service.start_session` raise its own clean 400 for an unknown
     # mode, instead of a generic Pydantic 422 with no app-specific message.
     mode: str
+    # How many questions per phase. "quick" ≈ 50 %, "standard" = 100 % (default),
+    # "deep" ≈ 150 % — clamped to min 1 per phase server-side.
+    intensity: Literal["quick", "standard", "deep"] = "standard"
+
+
+class CodingAnswerSubmission(BaseModel):
+    """Submitted immediately for async background scoring."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    session_id: str
+    question_id: str
+    phase: str = "coding_logic"
+    image_base64: str
+    image_mime_type: str | None = None
+    image_width: int | None = None
+    image_height: int | None = None
+    image_size_bytes: int | None = None
+
+
+class CodingScoreStatus(BaseModel):
+    """Polling response for async coding-score job status."""
+    question_id: str
+    status: Literal["pending", "processing", "complete", "failed"]
+    score: int | None = None
+    feedback: str | None = None
+    transcription: str | None = None
+    criteria_scores: dict[str, int] = Field(default_factory=dict)
+    estimated_seconds: int = 180
+
+
+class VoiceAnswerSubmission(BaseModel):
+    """Voice answer submitted immediately for async background Whisper+Ollama scoring."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    session_id: str
+    question_id: str
+    phase: str  # "hr" | "behavioral"
+    audio_base64: str
+    audio_format: str | None = None
+    answer_duration_seconds: int | None = None
+
+
+class VoiceScoreStatusItem(BaseModel):
+    """Polling response for async voice-score job status."""
+    question_id: str
+    phase: str
+    status: Literal["pending", "processing", "complete", "failed"]
+    score: int | None = None
+    feedback: str | None = None
+    transcription: str | None = None
+    criteria_scores: dict[str, int] = Field(default_factory=dict)
+    # Voice scoring is faster than coding OCR (no image parsing step)
+    estimated_seconds: int = 90
+
+
+class NotificationTokenRegister(BaseModel):
+    """Device push-token registration payload."""
+    expo_push_token: str
+    platform: Literal["ios", "android", "web"] = "ios"
 
 
 class SessionStartResponse(BaseModel):

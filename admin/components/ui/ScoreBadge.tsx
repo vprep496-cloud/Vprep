@@ -1,41 +1,29 @@
-// Phase 6 — pill that color-codes a 0-100 score, shared by the candidates
-// directory, candidate detail (assessments/sessions), and session-review UI.
-// Thresholds and Tailwind classes mirror `scoreBadgeMeta` in the mobile app's
-// `app/(app)/interview/results/[sessionId].tsx` (>=70 success / >=50 warning /
-// below danger) — same product meaning, same palette, just ported to web
-// className strings instead of React Native `className` + NativeWind.
-
 interface ScoreBadgeProps {
   score: number | null | undefined;
   size?: "sm" | "md";
 }
 
-function scoreBadgeStyles(score: number): { container: string; label: string } {
-  if (score >= 70) return { container: "bg-success/15", label: "text-success" };
-  if (score >= 50) return { container: "bg-warning/15", label: "text-warning" };
-  return { container: "bg-danger/15", label: "text-danger" };
+function getScoreConfig(score: number): { bg: string; text: string; ring: string } {
+  if (score >= 70) return { bg: "bg-success/10", text: "text-success", ring: "ring-success/25" };
+  if (score >= 50) return { bg: "bg-amber-500/10", text: "text-amber-600", ring: "ring-amber-500/25" };
+  return { bg: "bg-danger/10", text: "text-danger", ring: "ring-danger/25" };
 }
 
-const SIZE_STYLES: Record<NonNullable<ScoreBadgeProps["size"]>, string> = {
-  sm: "px-2 py-0.5 text-xs",
-  md: "px-2.5 py-1 text-sm",
-};
-
 export default function ScoreBadge({ score, size = "sm" }: ScoreBadgeProps) {
+  const sizeClass = size === "md" ? "px-3 py-1 text-sm font-bold" : "px-2.5 py-0.5 text-xs font-semibold";
+
   if (score === null || score === undefined) {
     return (
-      <span
-        className={`inline-flex items-center rounded-full font-semibold bg-background-surface text-text-muted ${SIZE_STYLES[size]}`}
-      >
-        — N/A
+      <span className={`inline-flex items-center rounded-full bg-background-surface text-text-muted ring-1 ring-border ${sizeClass}`}>
+        N/A
       </span>
     );
   }
 
-  const { container, label } = scoreBadgeStyles(score);
+  const { bg, text, ring } = getScoreConfig(score);
   return (
-    <span className={`inline-flex items-center rounded-full font-bold ${container} ${label} ${SIZE_STYLES[size]}`}>
-      {Math.round(score)}/100
+    <span className={`inline-flex items-center rounded-full ring-1 ${bg} ${text} ${ring} ${sizeClass}`}>
+      {Math.round(score)}<span className="ml-0.5 opacity-60">/100</span>
     </span>
   );
 }

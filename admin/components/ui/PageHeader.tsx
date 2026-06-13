@@ -1,14 +1,5 @@
 import type { ReactNode } from "react";
 
-// Phase 6 — shared page-title block. Extracted from the markup duplicated
-// across `users/page.tsx` (title + count badge + description) so the four new
-// Phase 6 pages (candidates, candidate detail, questions, analytics) render a
-// consistent header without re-deriving that layout each time. `actions` is
-// the right-aligned slot for page-level controls (e.g. questions' "Add
-// Question" button, analytics' time-window pills, candidate-detail's "Back to
-// Candidates" link) — kept generic (`ReactNode`) since each page's controls
-// differ in kind, not just content.
-
 interface PageHeaderProps {
   title: string;
   description?: string;
@@ -18,19 +9,23 @@ interface PageHeaderProps {
 
 export default function PageHeader({ title, description, badge, actions }: PageHeaderProps) {
   return (
-    <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-bold text-text-primary">{title}</h1>
+    <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <h1 className="text-xl font-bold text-text-primary tracking-tight">{title}</h1>
           {badge ? (
-            <span className="rounded-full bg-background-card px-2.5 py-1 text-xs font-semibold text-text-secondary">
+            <span className="inline-flex items-center rounded-full bg-primary-500/10 px-2.5 py-0.5 text-xs font-semibold text-primary-600 ring-1 ring-primary-500/20">
               {badge}
             </span>
           ) : null}
         </div>
-        {description ? <p className="mt-1 text-sm text-text-secondary">{description}</p> : null}
+        {description ? (
+          <p className="mt-1 text-sm text-text-secondary leading-relaxed">{description}</p>
+        ) : null}
       </div>
-      {actions ? <div className="flex shrink-0 items-center gap-3">{actions}</div> : null}
+      {actions ? (
+        <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>
+      ) : null}
     </div>
   );
 }

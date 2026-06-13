@@ -24,6 +24,17 @@ _QUESTION_COUNT = 7
 _MAX_ASSESSMENT_ANSWER_CHARS = 900
 _MAX_RAW_SCORE = _QUESTION_COUNT * 10  # 70 — every answer scored 0-10
 
+# Upper bound on how long the assessment start will wait for the local model to
+# generate the full personalized question set before falling back to seed
+# templates + background refinement. Keeps "Start" responsive on a slow laptop.
+_SYNC_GENERATION_TIMEOUT_SECONDS = 50
+
+# Minimum number of AI-authored questions (out of 7) for the synchronous
+# generation to count as "good enough" — the remaining slots are filled with
+# the role-personalized seed templates. Below this we fall back entirely and
+# let the background refiner retry.
+_MIN_AI_QUESTIONS = 3
+
 # Plan length is driven purely by skill level, per the Phase 3 spec — not by
 # the track's nominal `total_days` (which is just a display figure on the card).
 _PLAN_DAYS_BY_SKILL_LEVEL = {"beginner": 30, "intermediate": 21, "advanced": 14}
@@ -83,9 +94,19 @@ async def _call_ai_json(
 # ---------------------------------------------------------------------------
 
 
-async def _candidate_profile_context(user_id: str, db) -> dict[str, Any]:
+async def _candidate_profile_context(
+    user_id: str,
+    db,
+    track_id: str | None = None,
+    *,
+    role_id: str | None = None,
+    role_label: str | None = None,
+) -> dict[str, Any]:
     from bson import ObjectId
     from bson.errors import InvalidId
+
+    from app.api.v1.tracks import get_track_or_none
+    from app.services.role_catalog import find_role, focus_for_role, infer_seniority_from_label
 
     try:
         user = await db["users"].find_one({"_id": ObjectId(user_id)})
@@ -102,9 +123,53 @@ async def _candidate_profile_context(user_id: str, db) -> dict[str, Any]:
         or "beginner"
     )
 
+    # Resolve the target role this assessment should personalize to, in order:
+    #   1. an explicit role passed with the request (chosen on the tracks screen
+    #      BEFORE the assessment starts),
+    #   2. this track's enrollment role (set on a prior enroll),
+    #   3. the global onboarding role.
+    # This is what makes the assessment say "preparing for <the role you picked
+    # for THIS track>" instead of one global role reused everywhere.
+    track = await get_track_or_none(track_id, db) if track_id else None
+    enrollment = (
+        await db["enrollments"].find_one({"user_id": user_id, "track_id": track_id}) if track_id else None
+    )
+
+    target_role: str | None = None
+    target_role_id: str | None = None
+    role_seniority: str | None = None
+
+    if role_id and track is not None:
+        matched = find_role(track, role_id=role_id)
+        if matched:
+            target_role, target_role_id, role_seniority = matched["label"], matched["id"], matched["seniority"]
+    if not target_role and role_label and role_label.strip():
+        clean = role_label.strip()[:120]
+        matched = find_role(track, label=clean) if track is not None else None
+        if matched:
+            target_role, target_role_id, role_seniority = matched["label"], matched["id"], matched["seniority"]
+        else:
+            target_role, role_seniority = clean, infer_seniority_from_label(clean)
+    if not target_role and enrollment is not None:
+        target_role = enrollment.get("target_role")
+        target_role_id = enrollment.get("target_role_id")
+        role_seniority = enrollment.get("role_seniority")
+    if not target_role:
+        target_role = (user or {}).get("target_role") or profile.get("target_role")
+    if not role_seniority:
+        role_seniority = infer_seniority_from_label(target_role)
+    role_focus = focus_for_role(track_id or "", target_role_id, target_role)
+
+    logger.info(
+        "[profile] track=%s role_id_in=%s label_in=%s → resolved role=%r seniority=%s focus=%s",
+        track_id, role_id, role_label, target_role, role_seniority, role_focus[:3] if role_focus else [],
+    )
+
     return {
         "level": normalize_level(level),
-        "target_role": (user or {}).get("target_role") or profile.get("target_role"),
+        "target_role": target_role,
+        "role_seniority": role_seniority,
+        "role_focus": role_focus,
         "years_experience": (user or {}).get("years_experience") or profile.get("years_experience"),
         "skills": profile.get("skills") if isinstance(profile.get("skills"), list) else [],
         "projects": profile.get("projects") if isinstance(profile.get("projects"), list) else [],
@@ -139,9 +204,19 @@ def _profile_prompt_context(profile: dict[str, Any]) -> str:
         _compact_text(item, max_chars=90)
         for item in (profile.get("education", []) if isinstance(profile.get("education"), list) else [])[:3]
     )
+    seniority = str(profile.get("role_seniority") or "mid").lower()
+    if seniority == "junior":
+        seniority_note = "Target seniority: JUNIOR/entry-level — keep questions fundamental and approachable, not advanced."
+    elif seniority == "senior":
+        seniority_note = "Target seniority: SENIOR — questions may probe depth, tradeoffs, and judgment."
+    else:
+        seniority_note = "Target seniority: mid-level — balance core understanding with practical depth."
+    role_focus = _compact_list_text(profile.get("role_focus"), limit=8, max_item_chars=40)
     return (
         f"Candidate level: {profile['level']}\n"
         f"Target role: {profile.get('target_role') or 'not provided'}\n"
+        f"{seniority_note}\n"
+        f"Role focus areas to emphasize: {role_focus or 'use the track topic areas'}\n"
         f"Previous role signals: {roles or 'not provided'}\n"
         f"Years of experience: {profile.get('years_experience') if profile.get('years_experience') is not None else 'not provided'}\n"
         f"CV/profile summary: {profile.get('summary') or 'not provided'}\n"
@@ -153,11 +228,17 @@ def _profile_prompt_context(profile: dict[str, Any]) -> str:
 
 def _build_questions_prompt(track_name: str, topic_areas: list[str], profile: dict[str, Any]) -> str:
     topic_list = ", ".join(topic_areas)
+    # Use the resolved target role for the intro framing — this is the single
+    # most important signal the 3B model needs to stay on-topic. Using the
+    # track name here (e.g. "ML & AI") conflicts with an explicit role like
+    # "MLOps Engineer" in the profile context below and reliably causes the
+    # model to ignore the role and default to generic questions.
+    target_role = profile.get("target_role") or track_name
 
     intro = (
-        f'You are designing a screening interview assessment for a candidate '
-        f'applying to a "{track_name}" role.\n\n'
-        f"The relevant topic areas for this role are: {topic_list}.\n\n"
+        f'You are conducting a technical screening interview for a candidate '
+        f'targeting the role of "{target_role}" in the {track_name} domain.\n\n'
+        f"The key topic areas for this role are: {topic_list}.\n\n"
         "Personalize the assessment using this candidate profile. Do not include "
         "names, employers, schools, or any personal identifiers in the questions.\n"
         f"{_profile_prompt_context(profile)}\n\n"
@@ -195,19 +276,22 @@ def _build_questions_prompt(track_name: str, topic_areas: list[str], profile: di
         "Assign section metadata exactly as follows: q1-q2 section_id "
         "`fundamentals`, q3-q5 section_id `practical_reasoning`, q6-q7 "
         "section_id `applied_judgment`.\n\n"
-        "Respond with a JSON array of exactly 7 objects, with ids \"q1\" through "
-        "\"q7\" in order, using exactly this schema:\n"
-        "[\n"
-        "  {\n"
-        '    "id": "q1",\n'
-        '    "question": "...",\n'
-        '    "topic_area": "...",\n'
-        '    "section_id": "fundamentals",\n'
-        '    "section_title": "Fundamentals",\n'
-        '    "difficulty": "easy",\n'
-        '    "model_answer": "..."\n'
-        "  }\n"
-        "]"
+        "Respond with a JSON object whose `questions` value is an array of "
+        "exactly 7 objects, with ids \"q1\" through \"q7\" in order, using "
+        "exactly this schema:\n"
+        "{\n"
+        '  "questions": [\n'
+        "    {\n"
+        '      "id": "q1",\n'
+        '      "question": "...",\n'
+        '      "topic_area": "...",\n'
+        '      "section_id": "fundamentals",\n'
+        '      "section_title": "Fundamentals",\n'
+        '      "difficulty": "easy",\n'
+        '      "model_answer": "..."\n'
+        "    }\n"
+        "  ]\n"
+        "}"
     )
 
     return intro + body + _JSON_ONLY_SUFFIX
@@ -244,18 +328,24 @@ def _build_remaining_questions_prompt(
         "- Do not ask the candidate to write long essays, lists of many items, or code in this text assessment.\n"
         "- Never include personal identifiers, names, employers, schools, exact dates, emails, or phone numbers.\n"
         "- Include concise server-side model_answer rubrics.\n\n"
-        "Return a JSON array of exactly 6 objects, ids q2 through q7, using this schema:\n"
-        "[\n"
-        "  {\n"
-        '    "id": "q2",\n'
-        '    "question": "...",\n'
-        '    "topic_area": "...",\n'
-        '    "section_id": "fundamentals",\n'
-        '    "section_title": "Fundamentals",\n'
-        '    "difficulty": "easy",\n'
-        '    "model_answer": "..."\n'
-        "  }\n"
-        "]"
+        # Wrap in an object — Ollama's format=json collapses bare top-level
+        # arrays into a single object, so always request {"key": [...]} and
+        # let _coerce_question_list() extract the array on the way back.
+        "Return a JSON object with a `questions` array of exactly 6 objects, "
+        "ids q2 through q7, using this schema:\n"
+        "{\n"
+        '  "questions": [\n'
+        "    {\n"
+        '      "id": "q2",\n'
+        '      "question": "...",\n'
+        '      "topic_area": "...",\n'
+        '      "section_id": "fundamentals",\n'
+        '      "section_title": "Fundamentals",\n'
+        '      "difficulty": "easy",\n'
+        '      "model_answer": "..."\n'
+        "    }\n"
+        "  ]\n"
+        "}"
         + _JSON_ONLY_SUFFIX
     )
 
@@ -421,6 +511,43 @@ def _normalize_question_candidate(raw: Any, seed: dict, index: int) -> dict | No
         ),
         "model_answer": model_answer,
     }
+
+
+def _merge_ai_over_seeds(raw: Any, seed_questions: list[dict]) -> tuple[list[dict], int]:
+    """Overlay whatever usable AI questions the local model returned onto the
+    7 role-personalized seed templates, slot by slot.
+
+    The 3B model rarely returns a complete, perfectly-formed set of 7 in one
+    call, so an all-or-nothing parse usually throws everything away and the
+    candidate sees only templates. Merging keeps every AI question the model
+    *did* produce (matched by id `q1..q7`, else by order) and fills the rest
+    with the role-aware seeds — guaranteeing 7 questions that are mostly AI and
+    always personalized. Returns the merged list and the count of AI slots.
+    """
+    candidates = _coerce_question_list(raw) or []
+    by_id: dict[str, dict] = {}
+    ordered: list[dict] = []
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            ordered.append(candidate)
+            cid = str(candidate.get("id", "")).strip().lower()
+            if cid:
+                by_id[cid] = candidate
+
+    merged: list[dict] = []
+    ai_count = 0
+    for index in range(1, _QUESTION_COUNT + 1):
+        seed = seed_questions[index - 1]
+        raw_candidate = by_id.get(f"q{index}")
+        if raw_candidate is None and index - 1 < len(ordered):
+            raw_candidate = ordered[index - 1]
+        normalized = _normalize_question_candidate(raw_candidate, seed, index) if raw_candidate else None
+        if normalized:
+            merged.append(normalized)
+            ai_count += 1
+        else:
+            merged.append(seed)
+    return merged, ai_count
 
 
 def _coerce_question_list(raw: Any) -> list[dict] | None:
@@ -944,22 +1071,58 @@ async def generate_questions(
     track_id: str,
     user_id: str,
     background_tasks: BackgroundTasks | None = None,
+    *,
+    target_role_id: str | None = None,
+    target_role: str | None = None,
 ) -> tuple[str, list[dict]]:
-    """Start a progressive 7-question assessment session for `track_id`.
+    """Start a 7-question assessment session for `track_id`, personalized to
+    the candidate's track, target role, seniority, and skill level.
 
-    The first personalized seed question is returned immediately. Questions
-    q2-q7 are seeded too, so the user is never blocked; a background task then
-    refines unserved questions with local AI while q1 is being answered.
+    The full set is generated by the local AI up front so even the first
+    question is intelligent and role-specific. If the local model is slow or
+    unavailable, we fall back to deterministic seed templates immediately and
+    refine the rest in the background — so the assessment never blocks.
     """
     db = get_db()
     track = await get_track_or_none(track_id, db)
     if track is None:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unknown track_id.")
 
-    profile = await _candidate_profile_context(user_id, db)
+    profile = await _candidate_profile_context(
+        user_id, db, track_id, role_id=target_role_id, role_label=target_role
+    )
     predefined_anchors = await _load_predefined_assessment_anchors(db, track_id, profile)
-    questions = _fallback_questions(track, profile, predefined_anchors)
+    topic_areas = track.get("topic_areas") or [track.get("name", "Interview fundamentals")]
+
+    # Primary path: generate all 7 questions with local AI, personalized to the
+    # track + target role + seniority + skill level. Bounded so a slow model
+    # can't hang the assessment start.
+    seed_questions = _fallback_questions(track, profile, predefined_anchors)
+    questions = seed_questions
     question_source = "progressive_seed"
+    generation_status = "pending"
+    try:
+        prompt = _build_questions_prompt(track["name"], topic_areas, profile)
+        raw = await asyncio.wait_for(
+            _call_ai_json(prompt, temperature=_settings.AI_CREATIVE_TEMPERATURE, max_output_tokens=4096),
+            timeout=_SYNC_GENERATION_TIMEOUT_SECONDS,
+        )
+        merged, ai_count = _merge_ai_over_seeds(raw, seed_questions)
+        # Accept the AI set as long as it meaningfully personalized the
+        # assessment (most slots are AI). Below that, treat it as a failed
+        # generation and let the background refiner try again.
+        if ai_count >= _MIN_AI_QUESTIONS:
+            questions = merged
+            question_source = "ai_full" if ai_count >= _QUESTION_COUNT else "ai_partial"
+            generation_status = "completed" if ai_count >= _QUESTION_COUNT else "completed_partial"
+        else:
+            raise ValueError(f"only {ai_count} usable AI questions")
+    except Exception as exc:
+        logger.warning(
+            "Synchronous AI assessment generation incomplete for track=%s; using seeds + background refine: %s",
+            track_id,
+            exc,
+        )
 
     session_id = str(uuid.uuid4())
     await db["assessment_sessions"].insert_one(
@@ -971,14 +1134,27 @@ async def generate_questions(
             "candidate_profile_snapshot": profile,
             "predefined_anchor_count": len(predefined_anchors),
             "question_source": question_source,
-            "generation_status": "pending",
+            "generation_status": generation_status,
             "served_question_indexes": [1],
             "completed": False,
             "created_at": datetime.now(timezone.utc),
         }
     )
 
-    if background_tasks is not None:
+    logger.info(
+        "[assessment] track=%s role=%r seniority=%s source=%s status=%s session=%s",
+        track_id,
+        profile.get("target_role"),
+        profile.get("role_seniority"),
+        question_source,
+        generation_status,
+        session_id,
+    )
+
+    # Only schedule background refinement when we fully fell back to seed
+    # templates. A partial AI set is already personalized, and re-refining would
+    # overwrite the good AI questions the model did produce.
+    if generation_status == "pending" and background_tasks is not None:
         background_tasks.add_task(_refine_remaining_questions, session_id, track_id, profile)
 
     return session_id, _sanitize_questions(questions[:1])
