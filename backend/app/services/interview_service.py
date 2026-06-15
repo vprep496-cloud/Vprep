@@ -14,8 +14,7 @@ from bson.errors import InvalidId
 from fastapi import HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
 
-from app.models.enrollment import EnrollmentProgress
-from app.services import admin_ai_service, enrollment_service
+from app.services import admin_ai_service
 from app.services.profile_service import normalize_level
 from app.services.role_catalog import (
     effective_difficulty,
@@ -935,9 +934,9 @@ async def _score_coding_answer_background(
             (scoring_metadata.get("provider") or "unknown"),
         )
 
-        # Send push notification to user
+        # Send push notification to user (best-effort — include session_id for deep-link)
         try:
-            await send_coding_result_notification(session["user_id"], final_score, db)
+            await send_coding_result_notification(session["user_id"], final_score, session_id, db)
         except Exception as notify_exc:
             logger.warning("Coding result notification failed: %s", notify_exc)
 
@@ -1115,6 +1114,89 @@ async def _score_voice_answer_background(
         {"$set": {"answers.$.voice_score_status": "processing"}},
     )
 
+    # -----------------------------------------------------------------------
+    # Load session, answer, and audio ONCE before the retry loop.
+    #
+    # Previously the load was inside every retry iteration, which caused a
+    # fatal race condition:
+    #   1. User presses "Finish Interview" → complete_session() runs
+    #   2. complete_session() clears _voice_audio_base64 via $[] operator
+    #   3. Retry attempt #2 re-loads from DB → audio_base64 = None → crash
+    #
+    # By loading the audio into memory here and immediately clearing the DB
+    # copy, we achieve two goals:
+    #   • Audio is safe in-memory for every retry attempt.
+    #   • The MongoDB document shrinks by ~4 MB per voice answer, so
+    #     complete_session()'s $set (which embeds phase_results) cannot push
+    #     the document past MongoDB's 16 MB BSON size limit.
+    # -----------------------------------------------------------------------
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        return
+
+    answer = next(
+        (a for a in session.get("answers", []) if a["question_id"] == question_id),
+        None,
+    )
+    if answer is None:
+        return
+
+    audio_base64: str | None = answer.get("_voice_audio_base64")
+    audio_format: str | None = answer.get("_voice_audio_format") or None
+    phase: str = answer.get("phase", "hr")
+
+    if not audio_base64:
+        logger.error(
+            "Background voice score: no audio data found — cannot score. "
+            "session_id=%s question_id=%s",
+            session_id, question_id,
+        )
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.voice_score_status": "failed",
+                "answers.$.feedback": "Automatic scoring failed — no audio data was stored.",
+                "answers.$.manual_review_status": "pending",
+            }},
+        )
+        return
+
+    # Retrieve the full question (with model_answer) from questions_by_phase
+    phase_questions: list[dict] = session.get("questions_by_phase", {}).get(phase, [])
+    question_doc: dict | None = next(
+        (q for q in phase_questions if q["id"] == question_id), None
+    )
+    if question_doc is None:
+        logger.error(
+            "Background voice score: question %s not found in session %s — cannot score.",
+            question_id, session_id,
+        )
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {
+                "answers.$.voice_score_status": "failed",
+                "answers.$.feedback": "Automatic scoring failed — question data not found.",
+                "answers.$.manual_review_status": "pending",
+            }},
+        )
+        return
+
+    # Clear the stored audio blob from MongoDB immediately.
+    # This shrinks the document *before* complete_session() adds phase_results,
+    # preventing the 16 MB BSON limit from being exceeded.
+    # The audio remains available in-memory (audio_base64) for all retries.
+    await db["sessions"].update_one(
+        {"_id": object_id, "answers.question_id": question_id},
+        {"$set": {
+            "answers.$._voice_audio_base64": None,
+            "answers.$._voice_audio_format": None,
+        }},
+    )
+    logger.debug(
+        "Background voice score: audio blob cleared from DB. session_id=%s question_id=%s",
+        session_id, question_id,
+    )
+
     _RETRY_DELAYS = (0, 5, 20)   # seconds before each attempt (0 = immediate first try)
     _SCORE_TIMEOUT = 180          # per-attempt timeout in seconds
 
@@ -1129,34 +1211,11 @@ async def _score_voice_answer_background(
             await asyncio.sleep(delay)
 
         try:
-            session = await db["sessions"].find_one({"_id": object_id})
-            if session is None:
-                return
-
-            answer = next(
-                (a for a in session.get("answers", []) if a["question_id"] == question_id),
-                None,
-            )
-            if answer is None:
-                return
-
-            audio_base64 = answer.get("_voice_audio_base64")
-            audio_format = answer.get("_voice_audio_format") or None
-            phase = answer.get("phase", "hr")
-
-            if not audio_base64:
-                raise ValueError("No audio data stored for background scoring.")
-
-            # Retrieve the full question (with model_answer) from questions_by_phase
-            phase_questions = session.get("questions_by_phase", {}).get(phase, [])
-            question = next((q for q in phase_questions if q["id"] == question_id), None)
-            if question is None:
-                raise ValueError("Question not found in session.")
-
             # Guard against Ollama hang — hard timeout per scoring attempt
             scored = await asyncio.wait_for(
                 score_voice_answer(
-                    question, audio_base64, audio_format, answer.get("answer_duration_seconds")
+                    question_doc, audio_base64, audio_format,
+                    answer.get("answer_duration_seconds"),
                 ),
                 timeout=_SCORE_TIMEOUT,
             )
@@ -1179,7 +1238,7 @@ async def _score_voice_answer_background(
                     "answers.$.transcription": scored.get("transcription"),
                     "answers.$.criteria_scores": scored.get("criteria_scores", {}),
                     "answers.$.feedback": scored.get("feedback", ""),
-                    "answers.$.model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+                    "answers.$.model_answer": scored.get("model_answer") or question_doc.get("model_answer", ""),
                     "answers.$.confidence": scored.get("confidence"),
                     "answers.$.strengths": scored.get("strengths", []),
                     "answers.$.improvements": scored.get("improvements", []),
@@ -1198,8 +1257,7 @@ async def _score_voice_answer_background(
                     "answers.$.ai_scoring_metadata": scoring_metadata,
                     "answers.$.manual_review_status": manual_review,
                     "answers.$.voice_score_status": "complete",
-                    # Strip stored audio after successful scoring
-                    "answers.$._voice_audio_base64": None,
+                    # Audio blob already cleared from DB before retries began
                 }},
             )
 
@@ -1209,9 +1267,9 @@ async def _score_voice_answer_background(
                 attempt, session_id, question_id, phase, final_score,
             )
 
-            # Push notification (best-effort — don't let a push failure unwind the score)
+            # Push notification (best-effort — include session_id for deep-link to results)
             try:
-                await send_voice_result_notification(session["user_id"], final_score, phase, db)
+                await send_voice_result_notification(session["user_id"], final_score, phase, session_id, db)
             except Exception as notify_exc:
                 logger.warning("Voice result notification failed: %s", notify_exc)
 
@@ -1365,6 +1423,67 @@ def _merge_live_answers(phase_results: list[dict], live_answers: list[dict]) -> 
     return merged
 
 
+def _recompute_phase_and_overall(
+    merged_phases: list[dict],
+    present_phases: list[str],
+) -> tuple[list[dict], int]:
+    """Re-derive phase scores and overall score from the already-merged answer
+    data so that the client always sees accurate numbers after background
+    voice/coding scoring completes.
+
+    Phase scores stored in the session document at complete_session() time are
+    stale for any phase that contained pending voice/coding answers (those used
+    score=0 placeholders).  Once the background tasks finish and the client
+    re-fetches, _merge_live_answers() has already updated the individual answer
+    scores — but the phase-level ``score`` field and the top-level
+    ``overall_score`` would still reflect the stale computation.
+
+    We skip re-computation for any phase that still has pending answers so the
+    displayed phase score doesn't flicker from 0 → partial → final.
+    """
+    phase_scores: dict[str, int] = {}
+    updated: list[dict] = []
+
+    for phase_data in merged_phases:
+        answers = phase_data.get("answers", [])
+        # A phase is "settled" when no answer is still being scored.
+        has_pending = any(
+            a.get("voice_score_status") in ("pending", "processing")
+            or a.get("coding_score_status") in ("pending", "processing")
+            for a in answers
+        )
+        if not has_pending and answers:
+            computed_score = round(
+                sum((a.get("score") or 0) for a in answers) / len(answers)
+            )
+        else:
+            # Keep the stored phase score while background scoring is in progress
+            computed_score = phase_data.get("score", 0)
+        phase_scores[phase_data["phase"]] = computed_score
+        updated.append({**phase_data, "score": computed_score})
+
+    # Only recompute overall when all phases are fully settled
+    all_settled = all(
+        not any(
+            a.get("voice_score_status") in ("pending", "processing")
+            or a.get("coding_score_status") in ("pending", "processing")
+            for a in ph.get("answers", [])
+        )
+        for ph in updated
+    )
+    if all_settled and phase_scores:
+        weights = _phase_weights(present_phases or list(phase_scores.keys()))
+        overall = round(
+            sum(phase_scores.get(p, 0) * weights.get(p, 0) for p in weights)
+        )
+        overall = max(0, min(overall, 100))
+    else:
+        # Return sentinel so callers know the score is still provisional
+        overall = -1  # signals "pending" to to_session_result
+
+    return updated, overall
+
+
 def to_session_result(session: dict) -> dict:
     """Project a completed session document down to the SessionResult shape
     (also reused by GET /session/{id}, GET /history, and all admin routes).
@@ -1372,15 +1491,24 @@ def to_session_result(session: dict) -> dict:
     Merges live answer data from the session's answers array back into the
     stored phase_results so that background-scored answers (voice/coding) always
     show their final score, code_analysis, star_analysis, etc. rather than the
-    placeholder values stored at complete_session() time."""
+    placeholder values stored at complete_session() time.
+
+    Also recomputes phase scores and overall_score from the merged answers so
+    the displayed totals are accurate once background scoring completes — the
+    values stored at session-completion time used score=0 for pending answers."""
     live_answers: list[dict] = session.get("answers", [])
+    present_phases: list[str] = session.get("phases", [])
+    merged_phases = _merge_live_answers(session.get("phase_results", []), live_answers)
+    updated_phases, recomputed_overall = _recompute_phase_and_overall(merged_phases, present_phases)
+    # Use stored overall_score while any phase is still pending (recomputed_overall == -1)
+    overall_score = session["overall_score"] if recomputed_overall == -1 else recomputed_overall
     return {
         "id": session["id"],
         "user_id": session["user_id"],
         "track_id": session["track_id"],
         "mode": session["mode"],
-        "overall_score": session["overall_score"],
-        "phase_results": _merge_live_answers(session.get("phase_results", []), live_answers),
+        "overall_score": overall_score,
+        "phase_results": updated_phases,
         "started_at": session["started_at"],
         "completed_at": session["completed_at"],
         "duration_seconds": session["duration_seconds"],
@@ -1465,6 +1593,10 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
 
     completed_at = datetime.now(timezone.utc)
     started_at = session["started_at"]
+    # Motor returns timezone-naive datetime objects from MongoDB even when the
+    # value was stored as UTC.  Attach UTC so the subtraction is valid.
+    if started_at.tzinfo is None:
+        started_at = started_at.replace(tzinfo=timezone.utc)
     duration_seconds = max(0, int((completed_at - started_at).total_seconds()))
 
     updates = {
@@ -1474,23 +1606,49 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
         "overall_score": overall_score,
         "duration_seconds": duration_seconds,
     }
-    await db["sessions"].update_one({"_id": object_id}, {"$set": updates})
+    # Safety net: clear any remaining binary blobs atomically with the completion
+    # write.  Background voice/coding jobs clear their blobs as soon as they load
+    # the data (before scoring begins), but this catches edge cases:
+    #   • The background task hasn't been dispatched yet when the user finishes.
+    #   • A background task errored before it could clear its blob.
+    # Without this, embedding phase_results into a document that still holds
+    # 4+ voice recordings (~4 MB each) would exceed MongoDB's 16 MB BSON limit
+    # and produce an unhandled BSONDocumentTooLarge error → HTTP 500.
+    blob_clear = {
+        "answers.$[]._voice_audio_base64": None,
+        "answers.$[]._coding_image_base64": None,
+    }
+    await db["sessions"].update_one({"_id": object_id}, {"$set": {**updates, **blob_clear}})
 
     # ------------------------------------------------------------------
-    # Agent Rule #6 — must call enrollment_service.update_progress here,
-    # advancing `current_day` by 1 and folding this session's overall score
-    # into the enrollment's running average. `/start` already verified the
-    # candidate is enrolled, but we re-check defensively (e.g. they could in
-    # theory unenroll mid-session) — a missing enrollment shouldn't blow up
-    # session completion; it just means progress has nothing to advance.
+    # Agent Rule #6 — advance enrollment progress: current_day +1, fold this
+    # session's overall score into the running average.
+    #
+    # We do a direct update_one here instead of calling
+    # enrollment_service.update_progress() for two reasons:
+    #   1. update_progress() is designed to return an enriched enrollment
+    #      document (with track data, plan_exists, etc.) — complete_session()
+    #      doesn't use that return value at all, so the extra round-trips
+    #      (plan lookup, track lookup) are pure overhead.
+    #   2. update_progress() does a second find_one inside itself and can
+    #      raise HTTPException(404) if the enrollment disappears in the tiny
+    #      window between our check and its check — causing a spurious 500.
+    # A single update_one is atomic, fast, and safe.
     # ------------------------------------------------------------------
     enrollment = await db["enrollments"].find_one({"user_id": user_id, "track_id": session["track_id"]})
     if enrollment is not None:
-        progress = EnrollmentProgress(
-            current_day=enrollment.get("current_day", 1) + 1,
-            session_score=float(overall_score),
+        old_avg = enrollment.get("average_score", 0.0) or 0.0
+        total_sessions = enrollment.get("total_sessions", 0) or 0
+        new_avg = ((old_avg * total_sessions) + float(overall_score)) / (total_sessions + 1)
+        await db["enrollments"].update_one(
+            {"_id": enrollment["_id"]},
+            {"$set": {
+                "current_day": (enrollment.get("current_day", 1) or 1) + 1,
+                "average_score": new_avg,
+                "total_sessions": total_sessions + 1,
+                "updated_at": completed_at,
+            }},
         )
-        await enrollment_service.update_progress(user_id, session["track_id"], progress, db)
     else:
         logger.warning(
             "complete_session: no enrollment found for user_id=%s track_id=%s — skipping progress update",

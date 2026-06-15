@@ -41,6 +41,14 @@ function AuthGuard({ children }: { children: ReactNode }) {
   // Phase 4 addition — see import comment above for why this lives here.
   const setEnrollments = useAppStore((s) => s.setEnrollments);
 
+  // Safety timeout — if Firebase never fires onAuthStateChanged within 8 s
+  // (e.g. no internet on first cold start), stop showing the spinner so the
+  // user at least reaches the login screen.
+  useEffect(() => {
+    const t = setTimeout(() => setLoading(false), 8000);
+    return () => clearTimeout(t);
+  }, [setLoading]);
+
   // 1. Subscribe to Firebase auth state and hydrate the store accordingly.
   //
   // Demo-login awareness: demo accounts bypass Firebase entirely, so

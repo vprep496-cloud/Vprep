@@ -125,8 +125,14 @@ async def _get_user_push_token(user_id: str, db: AsyncIOMotorDatabase) -> str | 
 # ---------------------------------------------------------------------------
 
 
-async def send_coding_result_notification(user_id: str, score: int, db: AsyncIOMotorDatabase) -> None:
-    """Notify the user that their async coding score is ready."""
+async def send_coding_result_notification(
+    user_id: str, score: int, session_id: str, db: AsyncIOMotorDatabase
+) -> None:
+    """Notify the user that their async coding score is ready.
+
+    ``session_id`` is embedded in the data payload so the mobile app can
+    deep-link directly to the results screen when the notification is tapped.
+    """
     token = await _get_user_push_token(user_id, db)
     if not token:
         return
@@ -145,13 +151,19 @@ async def send_coding_result_notification(user_id: str, score: int, db: AsyncIOM
         [token],
         title=f"{emoji} Coding Score Ready",
         body=sub,
-        data={"type": "coding_result", "score": score},
+        data={"type": "coding_result", "score": score, "session_id": session_id},
         channel_id="results",
     )
 
 
-async def send_voice_result_notification(user_id: str, score: int, phase: str, db: AsyncIOMotorDatabase) -> None:
-    """Notify the user that their async voice answer score is ready."""
+async def send_voice_result_notification(
+    user_id: str, score: int, phase: str, session_id: str, db: AsyncIOMotorDatabase
+) -> None:
+    """Notify the user that their async voice answer score is ready.
+
+    ``session_id`` is embedded in the data payload so the mobile app can
+    deep-link directly to the results screen when the notification is tapped.
+    """
     token = await _get_user_push_token(user_id, db)
     if not token:
         return
@@ -172,7 +184,7 @@ async def send_voice_result_notification(user_id: str, score: int, phase: str, d
         [token],
         title=f"{emoji} {phase_label} Score Ready",
         body=sub,
-        data={"type": "voice_result", "score": score, "phase": phase},
+        data={"type": "voice_result", "score": score, "phase": phase, "session_id": session_id},
         channel_id="results",
     )
 

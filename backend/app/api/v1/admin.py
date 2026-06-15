@@ -829,6 +829,107 @@ async def get_analytics(
 
 
 # ---------------------------------------------------------------------------
+# GET /sessions — paginated sessions list for the Sessions dashboard page
+# ---------------------------------------------------------------------------
+
+
+@router.get("/sessions")
+async def list_sessions(
+    page: int = Query(1, ge=1),
+    limit: int = Query(20, ge=1, le=100),
+    candidate_id: str | None = Query(None),
+    track_id: str | None = Query(None),
+    days: int = Query(30, ge=1, le=365),
+    needs_review: bool = Query(False),
+    _current_user: dict = Depends(require_role("admin", "superadmin")),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Paginated list of completed sessions.  Returns a lightweight summary row
+    per session (no full answer data — use GET /sessions/{id} for full review).
+    Optionally filtered by candidate, track, date window, or pending-review flag.
+    Each row is enriched with the candidate's display_name and email via a single
+    batch user query (one round-trip for the whole page, never N+1)."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    match: dict = {"status": "completed", "completed_at": {"$gte": since}}
+
+    if candidate_id:
+        match["user_id"] = candidate_id
+    if track_id:
+        match["track_id"] = track_id
+    if needs_review:
+        # Any answer still pending manual review OR whose async scoring failed
+        match["$or"] = [
+            {"answers.manual_review_status": "pending"},
+            {"answers.voice_score_status": "failed"},
+            {"answers.coding_score_status": "failed"},
+        ]
+
+    total = await db["sessions"].count_documents(match)
+    pages = max(math.ceil(total / limit), 1)
+
+    # Projection strips all answer blobs — we only want summary-level data here
+    projection = {
+        "_id": 1, "user_id": 1, "track_id": 1, "mode": 1,
+        "overall_score": 1, "started_at": 1, "completed_at": 1,
+        "duration_seconds": 1, "phase_results.phase": 1,
+        "phase_results.score": 1, "phase_results.question_count": 1,
+    }
+    sessions_page = await (
+        db["sessions"]
+        .find(match, projection)
+        .sort("completed_at", -1)
+        .skip((page - 1) * limit)
+        .limit(limit)
+        .to_list(length=limit)
+    )
+    if not sessions_page:
+        return {"sessions": [], "total": total, "page": page, "pages": pages}
+
+    # Batch-fetch candidate names — one query for the whole page, not N+1
+    user_ids = list({s.get("user_id") for s in sessions_page if s.get("user_id")})
+    user_object_ids: list[ObjectId] = []
+    for uid in user_ids:
+        try:
+            user_object_ids.append(ObjectId(uid))
+        except (InvalidId, TypeError):
+            pass
+    user_docs = await db["users"].find(
+        {"_id": {"$in": user_object_ids}},
+        {"display_name": 1, "email": 1, "photo_url": 1},
+    ).to_list(length=len(user_object_ids) or 1)
+    user_map = {str(u["_id"]): u for u in user_docs}
+
+    result = []
+    for session in sessions_page:
+        uid = session.get("user_id", "")
+        user_info = user_map.get(uid, {})
+        phase_summaries = [
+            {
+                "phase": pr.get("phase"),
+                "score": pr.get("score", 0),
+                "question_count": pr.get("question_count", 0),
+            }
+            for pr in session.get("phase_results", [])
+        ]
+        result.append({
+            "id": str(session["_id"]),
+            "user_id": uid,
+            "candidate_name": user_info.get("display_name") or "Unknown",
+            "candidate_email": user_info.get("email") or "",
+            "candidate_photo": user_info.get("photo_url"),
+            "track_id": session.get("track_id"),
+            "mode": session.get("mode"),
+            "overall_score": session.get("overall_score", 0),
+            "started_at": session.get("started_at"),
+            "completed_at": session.get("completed_at"),
+            "duration_seconds": session.get("duration_seconds", 0),
+            "phase_results": phase_summaries,
+        })
+
+    return {"sessions": result, "total": total, "page": page, "pages": pages}
+
+
+# ---------------------------------------------------------------------------
 # GET /sessions/{session_id} — full session review (any candidate's session)
 # ---------------------------------------------------------------------------
 

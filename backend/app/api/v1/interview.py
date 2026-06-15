@@ -1,7 +1,12 @@
+import logging
+import traceback
+
 from bson import ObjectId
 from bson.errors import InvalidId
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from motor.motor_asyncio import AsyncIOMotorDatabase
+
+logger = logging.getLogger("vprep.interview")
 
 from app.api.v1.tracks import get_track_or_none
 from app.core.database import get_db
@@ -434,7 +439,22 @@ async def complete_interview(
 ):
     """Finalize a session: compute phase/overall scores, advance enrollment
     progress (Agent Rule #6), and return the full SessionResult."""
-    return await interview_service.complete_session(payload.session_id, current_user["id"], db)
+    try:
+        return await interview_service.complete_session(payload.session_id, current_user["id"], db)
+    except HTTPException:
+        raise  # let FastAPI handle 400/403/404 as-is
+    except Exception as exc:
+        # Log the full traceback so we can diagnose the 500 from the server console
+        logger.error(
+            "Unhandled exception in POST /complete — session_id=%s user_id=%s\n%s",
+            payload.session_id,
+            current_user.get("id"),
+            traceback.format_exc(),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Session completion failed: {type(exc).__name__}: {exc}",
+        ) from exc
 
 
 @router.get("/session/{session_id}")

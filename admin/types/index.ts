@@ -260,6 +260,25 @@ export interface AdminAnalytics {
   sessionCompletion: SessionCompletionPoint[];
 }
 
+export interface AdminSessionListItem {
+  id: string;
+  userId: string;
+  candidateName: string;
+  candidateEmail: string;
+  candidatePhoto: string | null;
+  trackId: string;
+  mode: InterviewMode;
+  overallScore: number;
+  startedAt: string;
+  completedAt: string;
+  durationSeconds: number;
+  phaseResults: Array<{
+    phase: InterviewPhase;
+    score: number;
+    questionCount: number;
+  }>;
+}
+
 export interface AIStatus {
   provider: string;
   configured: boolean;

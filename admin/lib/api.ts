@@ -3,6 +3,7 @@ import type {
   AdminAnalytics,
   AIStatus,
   AdminQuestion,
+  AdminSessionListItem,
   CandidateAssessment,
   CandidateDetail,
   CandidateEnrollment,
@@ -528,6 +529,53 @@ function toAIStatus(status: BackendAIStatus): AIStatus {
   };
 }
 
+interface BackendSessionListItem {
+  id: string;
+  user_id: string;
+  candidate_name: string;
+  candidate_email: string;
+  candidate_photo: string | null;
+  track_id: string;
+  mode: InterviewSessionResult["mode"];
+  overall_score: number;
+  started_at: string;
+  completed_at: string;
+  duration_seconds: number;
+  phase_results: Array<{
+    phase: InterviewPhaseResult["phase"];
+    score: number;
+    question_count: number;
+  }>;
+}
+
+interface BackendSessionsListResponse {
+  sessions: BackendSessionListItem[];
+  total: number;
+  page: number;
+  pages: number;
+}
+
+function toSessionListItem(item: BackendSessionListItem): AdminSessionListItem {
+  return {
+    id: item.id,
+    userId: item.user_id,
+    candidateName: item.candidate_name,
+    candidateEmail: item.candidate_email,
+    candidatePhoto: item.candidate_photo,
+    trackId: item.track_id,
+    mode: item.mode,
+    overallScore: item.overall_score,
+    startedAt: item.started_at,
+    completedAt: item.completed_at,
+    durationSeconds: item.duration_seconds,
+    phaseResults: item.phase_results.map((pr) => ({
+      phase: pr.phase,
+      score: pr.score,
+      questionCount: pr.question_count,
+    })),
+  };
+}
+
 // --- Request param / pagination shapes shared by list endpoints ---
 
 interface PaginatedResult<T> {
@@ -535,6 +583,15 @@ interface PaginatedResult<T> {
   total: number;
   page: number;
   pages: number;
+}
+
+export interface ListSessionsParams {
+  page?: number;
+  limit?: number;
+  candidateId?: string;
+  trackId?: string;
+  days?: number;
+  needsReview?: boolean;
 }
 
 export interface ListCandidatesParams {
@@ -745,6 +802,25 @@ export const adminApi = {
       scoreTrend: (data.score_trend ?? []).map(toScoreTrendPoint),
       trackDistribution: (data.track_distribution ?? []).map(toTrackDistributionPoint),
       sessionCompletion: data.session_completion ?? [],
+    };
+  },
+
+  async getSessions(params: ListSessionsParams = {}): Promise<PaginatedResult<AdminSessionListItem>> {
+    const { data } = await api.get<BackendSessionsListResponse>("/api/v1/admin/sessions", {
+      params: {
+        page: params.page ?? 1,
+        limit: params.limit ?? 20,
+        ...(params.candidateId ? { candidate_id: params.candidateId } : {}),
+        ...(params.trackId ? { track_id: params.trackId } : {}),
+        ...(params.days ? { days: params.days } : {}),
+        ...(params.needsReview ? { needs_review: true } : {}),
+      },
+    });
+    return {
+      items: (data.sessions ?? []).map(toSessionListItem),
+      total: data.total,
+      page: data.page,
+      pages: data.pages,
     };
   },
 
