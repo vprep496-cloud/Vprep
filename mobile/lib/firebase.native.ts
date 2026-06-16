@@ -4,6 +4,11 @@ import { getApps, getApp, initializeApp, type FirebaseApp } from "firebase/app";
 import {
   initializeAuth,
   getAuth,
+  // getReactNativePersistence is only exported by @firebase/auth's RN build
+  // (dist/rn/index.js). The web TypeScript types for "firebase/auth" don't
+  // declare it, so we suppress the type error here. Metro selects the RN build
+  // via the "react-native" field in @firebase/auth/package.json at runtime.
+  // @ts-expect-error – not in web type declarations; present in RN build at runtime
   getReactNativePersistence,
   type Auth,
 } from "firebase/auth";

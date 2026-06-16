@@ -999,8 +999,7 @@ export default function InterviewSessionScreen() {
       {tabsHeaderOptions}
     <SafeAreaView style={sStyles.flex} edges={["bottom", "left", "right"]}>
       <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} style={sStyles.flex}>
-        <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
-          <View style={sStyles.flex}>
+        <View style={sStyles.flex}>
             {/* Phase tab bar — tap any phase to jump to it */}
             <PhaseTabBar
               phases={phases}
@@ -1019,224 +1018,237 @@ export default function InterviewSessionScreen() {
               />
             </View>
 
+            {/*
+              IMPORTANT: Do NOT wrap ScrollView in TouchableWithoutFeedback.
+              On Android, TouchableWithoutFeedback intercepts the initial touch
+              event to watch for a tap, which prevents ScrollView from claiming
+              the gesture — making the list unscrollable.
+              Instead, we wrap only the scroll CONTENT in TouchableWithoutFeedback
+              (inside the ScrollView), and use keyboardDismissMode for drag-dismiss.
+            */}
             <ScrollView
               style={sStyles.flex}
               contentContainerStyle={sStyles.scrollContent}
               showsVerticalScrollIndicator={false}
               keyboardShouldPersistTaps="handled"
+              keyboardDismissMode="on-drag"
             >
-              {/* Question dots navigator */}
-              <ProgressDots
-                questions={phaseQuestions}
-                currentIndex={questionIndex}
-                answeredIds={answeredIds}
-                skippedIds={skippedIds}
-                onPress={navigateToQuestion}
-              />
-
-              {currentQuestion ? (
-                isCodingPhase ? (
-                  <CodingQuestionCard
-                    questionText={currentQuestion.questionText}
-                    questionNumber={questionIndex + 1}
-                    totalInPhase={totalInPhase}
+              <TouchableWithoutFeedback onPress={Keyboard.dismiss} accessible={false}>
+                <View>
+                  {/* Question dots navigator */}
+                  <ProgressDots
+                    questions={phaseQuestions}
+                    currentIndex={questionIndex}
+                    answeredIds={answeredIds}
+                    skippedIds={skippedIds}
+                    onPress={navigateToQuestion}
                   />
-                ) : (
-                  <QuestionDisplay
-                    question={currentQuestion}
-                    questionNumber={questionIndex + 1}
-                    totalInPhase={totalInPhase}
-                  />
-                )
-              ) : null}
 
-              {/* Skipped warning */}
-              {skippedInPhase.length > 0 && !feedback && !codingAck && (
-                <View style={sStyles.skippedBanner}>
-                  <Ionicons name="alert-circle-outline" size={14} color="#92400E" />
-                  <Text style={sStyles.skippedBannerText}>
-                    {skippedInPhase.length} question{skippedInPhase.length > 1 ? "s" : ""} skipped
-                    — answer them before finishing this section
-                  </Text>
-                </View>
-              )}
+                  {currentQuestion ? (
+                    isCodingPhase ? (
+                      <CodingQuestionCard
+                        questionText={currentQuestion.questionText}
+                        questionNumber={questionIndex + 1}
+                        totalInPhase={totalInPhase}
+                      />
+                    ) : (
+                      <QuestionDisplay
+                        question={currentQuestion}
+                        questionNumber={questionIndex + 1}
+                        totalInPhase={totalInPhase}
+                      />
+                    )
+                  ) : null}
 
-              <View style={sStyles.answerArea}>
-                {codingAck ? (
-                  <CodingProcessingBanner
-                    ack={codingAck}
-                    onContinue={advanceFromCodingAck}
-                    isFinal={isLastPhase}
-                  />
-                ) : !feedback ? (
-                  currentQuestion?.answerType === "voice" ? (
-                    <>
-                      {/* ── Status card: shown after saving, before the user advances ── */}
-                      {answeredIds.has(currentQuestion.id) && !voiceRecording && (
-                        allPhaseQuestionsAnswered ? (
-                          /* All recordings done — big summary card */
-                          <AnimatedView
-                            from={{ opacity: 0, translateY: 8 }}
-                            animate={{ opacity: 1, translateY: 0 }}
-                            transition={{ type: "timing", duration: 300 }}
-                            style={sStyles.voiceSummaryCard}
-                          >
-                            <View style={sStyles.voiceSummaryHeader}>
-                              <View style={sStyles.voiceSummaryIcon}>
-                                <Ionicons name="mic" size={22} color={colors.success} />
-                              </View>
-                              <View style={{ flex: 1 }}>
-                                <Text style={sStyles.voiceSummaryTitle}>
-                                  All {phaseQuestions.length} answers recorded
-                                </Text>
-                                <Text style={sStyles.voiceSummarySub}>
-                                  Ready to submit for AI scoring
-                                </Text>
-                              </View>
-                            </View>
-                            <View style={sStyles.voiceSummaryList}>
-                              {phaseQuestions.map((q, idx) => {
-                                const rec = pendingVoiceAnswers[q.id];
-                                const dur = rec?.durationSeconds ?? 0;
-                                return (
-                                  <View key={q.id} style={sStyles.voiceSummaryRow}>
-                                    <Ionicons name="checkmark-circle" size={14} color={colors.success} />
-                                    <Text style={sStyles.voiceSummaryQText} numberOfLines={1}>
-                                      Q{idx + 1} — {q.questionText}
+                  {/* Skipped warning */}
+                  {skippedInPhase.length > 0 && !feedback && !codingAck && (
+                    <View style={sStyles.skippedBanner}>
+                      <Ionicons name="alert-circle-outline" size={14} color="#92400E" />
+                      <Text style={sStyles.skippedBannerText}>
+                        {skippedInPhase.length} question{skippedInPhase.length > 1 ? "s" : ""} skipped
+                        — answer them before finishing this section
+                      </Text>
+                    </View>
+                  )}
+
+                  <View style={sStyles.answerArea}>
+                    {codingAck ? (
+                      <CodingProcessingBanner
+                        ack={codingAck}
+                        onContinue={advanceFromCodingAck}
+                        isFinal={isLastPhase}
+                      />
+                    ) : !feedback ? (
+                      currentQuestion?.answerType === "voice" ? (
+                        <>
+                          {/* ── Status card: shown after saving, before the user advances ── */}
+                          {answeredIds.has(currentQuestion.id) && !voiceRecording && (
+                            allPhaseQuestionsAnswered ? (
+                              /* All recordings done — big summary card */
+                              <AnimatedView
+                                from={{ opacity: 0, translateY: 8 }}
+                                animate={{ opacity: 1, translateY: 0 }}
+                                transition={{ type: "timing", duration: 300 }}
+                                style={sStyles.voiceSummaryCard}
+                              >
+                                <View style={sStyles.voiceSummaryHeader}>
+                                  <View style={sStyles.voiceSummaryIcon}>
+                                    <Ionicons name="mic" size={22} color={colors.success} />
+                                  </View>
+                                  <View style={{ flex: 1 }}>
+                                    <Text style={sStyles.voiceSummaryTitle}>
+                                      All {phaseQuestions.length} answers recorded
                                     </Text>
-                                    <Text style={sStyles.voiceSummaryDur}>
-                                      {`${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`}
+                                    <Text style={sStyles.voiceSummarySub}>
+                                      Ready to submit for AI scoring
                                     </Text>
                                   </View>
-                                );
-                              })}
-                            </View>
-                            <Text style={sStyles.voiceSummaryHint}>
-                              Tap "Submit All Recordings" below to finalise your interview.{"\n"}
-                              To re-record any answer, use the progress dots above to revisit it.
-                            </Text>
-                          </AnimatedView>
-                        ) : (
-                          /* Single question saved — compact badge */
-                          <AnimatedView
-                            from={{ opacity: 0, translateY: 6 }}
-                            animate={{ opacity: 1, translateY: 0 }}
-                            transition={{ type: "timing", duration: 240 }}
-                            style={sStyles.recordingSavedBadge}
-                          >
-                            <Ionicons name="checkmark-circle" size={18} color={colors.success} />
-                            <View style={sStyles.recordingSavedInfo}>
-                              <Text style={sStyles.recordingSavedTitle}>Answer recorded ✓</Text>
-                              <Text style={sStyles.recordingSavedSub}>
-                                Tap "Next Question" to continue, or record again below to replace
-                              </Text>
-                            </View>
-                            {pendingVoiceAnswers[currentQuestion.id] && (() => {
-                              const dur = pendingVoiceAnswers[currentQuestion.id].durationSeconds;
-                              return (
-                                <Text style={sStyles.recordingSavedDur}>
-                                  {`${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`}
+                                </View>
+                                <View style={sStyles.voiceSummaryList}>
+                                  {phaseQuestions.map((q, idx) => {
+                                    const rec = pendingVoiceAnswers[q.id];
+                                    const dur = rec?.durationSeconds ?? 0;
+                                    return (
+                                      <View key={q.id} style={sStyles.voiceSummaryRow}>
+                                        <Ionicons name="checkmark-circle" size={14} color={colors.success} />
+                                        <Text style={sStyles.voiceSummaryQText} numberOfLines={1}>
+                                          Q{idx + 1} — {q.questionText}
+                                        </Text>
+                                        <Text style={sStyles.voiceSummaryDur}>
+                                          {`${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`}
+                                        </Text>
+                                      </View>
+                                    );
+                                  })}
+                                </View>
+                                <Text style={sStyles.voiceSummaryHint}>
+                                  Tap "Submit All Recordings" below to finalise your interview.{"\n"}
+                                  To re-record any answer, use the progress dots above to revisit it.
                                 </Text>
-                              );
-                            })()}
-                          </AnimatedView>
-                        )
-                      )}
-                      {/* Recorder — hidden in "all done" summary state, shown otherwise */}
-                      {!allPhaseQuestionsAnswered || voiceRecording ? (
-                        <VoiceRecorder
-                          key={currentQuestion.id}
-                          onRecordingChange={setVoiceRecording}
+                              </AnimatedView>
+                            ) : (
+                              /* Single question saved — compact badge */
+                              <AnimatedView
+                                from={{ opacity: 0, translateY: 6 }}
+                                animate={{ opacity: 1, translateY: 0 }}
+                                transition={{ type: "timing", duration: 240 }}
+                                style={sStyles.recordingSavedBadge}
+                              >
+                                <Ionicons name="checkmark-circle" size={18} color={colors.success} />
+                                <View style={sStyles.recordingSavedInfo}>
+                                  <Text style={sStyles.recordingSavedTitle}>Answer recorded ✓</Text>
+                                  <Text style={sStyles.recordingSavedSub}>
+                                    Tap "Next Question" to continue, or record again below to replace
+                                  </Text>
+                                </View>
+                                {pendingVoiceAnswers[currentQuestion.id] && (() => {
+                                  const dur = pendingVoiceAnswers[currentQuestion.id].durationSeconds;
+                                  return (
+                                    <Text style={sStyles.recordingSavedDur}>
+                                      {`${Math.floor(dur / 60)}:${String(dur % 60).padStart(2, "0")}`}
+                                    </Text>
+                                  );
+                                })()}
+                              </AnimatedView>
+                            )
+                          )}
+                          {/* Recorder — hidden in "all done" summary state, shown otherwise */}
+                          {!allPhaseQuestionsAnswered || voiceRecording ? (
+                            <VoiceRecorder
+                              key={currentQuestion.id}
+                              onRecordingChange={setVoiceRecording}
+                              disabled={submitting}
+                            />
+                          ) : null}
+                        </>
+                      ) : currentQuestion?.answerType === "image" ? (
+                        <ImageAnswer value={imageAnswer} onChange={setImageAnswer} disabled={submitting} forCoding={isCodingPhase} />
+                      ) : (
+                        <TextAnswer
+                          value={textAnswer}
+                          onChangeText={setTextAnswer}
+                          minChars={MIN_TEXT_ANSWER_CHARS}
                           disabled={submitting}
                         />
-                      ) : null}
-                    </>
-                  ) : currentQuestion?.answerType === "image" ? (
-                    <ImageAnswer value={imageAnswer} onChange={setImageAnswer} disabled={submitting} forCoding={isCodingPhase} />
-                  ) : (
-                    <TextAnswer
-                      value={textAnswer}
-                      onChangeText={setTextAnswer}
-                      minChars={MIN_TEXT_ANSWER_CHARS}
-                      disabled={submitting}
-                    />
-                  )
-                ) : (
-                  // ─── Feedback card ────────────────────────────────────
-                  <AnimatedView
-                    from={{ opacity: 0, translateY: 12 }}
-                    animate={{ opacity: 1, translateY: 0 }}
-                    transition={{ type: "timing", duration: 280 }}
-                    style={sStyles.feedbackCard}
-                  >
-                    <View style={sStyles.feedbackHeader}>
-                      <Text style={sStyles.feedbackTitle}>Your Score</Text>
-                      <View
-                        style={[
-                          sStyles.scoreBadge,
-                          { backgroundColor: feedback.score >= 70 ? `${colors.success}26` : feedback.score >= 50 ? "#FEF3C720" : `${colors.danger}20` },
-                        ]}
+                      )
+                    ) : (
+                      // ─── Feedback card ────────────────────────────────────
+                      <AnimatedView
+                        from={{ opacity: 0, translateY: 12 }}
+                        animate={{ opacity: 1, translateY: 0 }}
+                        transition={{ type: "timing", duration: 280 }}
+                        style={sStyles.feedbackCard}
                       >
-                        <Text
-                          style={[
-                            sStyles.scoreBadgeText,
-                            { color: feedback.score >= 70 ? colors.success : feedback.score >= 50 ? "#D97706" : colors.danger },
-                          ]}
-                        >
-                          {feedback.score}/100
-                        </Text>
-                      </View>
-                    </View>
-
-                    {feedback.transcription ? (
-                      <View style={sStyles.feedbackSection}>
-                        <Text style={sStyles.feedbackSectionLabel}>Captured Response</Text>
-                        <Text style={sStyles.feedbackBodyText}>{feedback.transcription}</Text>
-                      </View>
-                    ) : null}
-
-                    <View style={sStyles.feedbackSection}>
-                      <Text style={sStyles.feedbackSectionLabel}>Feedback</Text>
-                      <Text style={sStyles.feedbackBodyText}>{feedback.feedback}</Text>
-                    </View>
-
-                    {(feedback.strengths?.length ?? 0) > 0 || (feedback.improvements?.length ?? 0) > 0 ? (
-                      <View style={sStyles.feedbackSection}>
-                        {(feedback.strengths ?? []).slice(0, 2).map((item, idx) => (
-                          <View key={`s${idx}`} style={sStyles.strengthChip}>
-                            <Text style={sStyles.strengthLabel}>Strength</Text>
-                            <Text style={sStyles.strengthText}>{item}</Text>
-                          </View>
-                        ))}
-                        {(feedback.improvements ?? []).slice(0, 2).map((item, idx) => (
-                          <View key={`i${idx}`} style={sStyles.improvementChip}>
-                            <Text style={sStyles.improvementLabel}>Improve</Text>
-                            <Text style={sStyles.improvementText}>{item}</Text>
-                          </View>
-                        ))}
-                      </View>
-                    ) : null}
-
-                    <View style={sStyles.feedbackSection}>
-                      <Text style={sStyles.feedbackSectionLabel}>Ideal Answer</Text>
-                      <Text style={sStyles.feedbackBodyText}>{feedback.modelAnswer}</Text>
-                    </View>
-
-                    {Object.keys(feedback.criteriaScores).length > 0 ? (
-                      <View style={sStyles.criteriaRow}>
-                        {Object.entries(feedback.criteriaScores).map(([criterion, value]) => (
-                          <View key={criterion} style={sStyles.criteriaBadge}>
-                            <Text style={sStyles.criteriaText}>
-                              {criterion.replace(/_/g, " ")}:{" "}
-                              <Text style={sStyles.criteriaScore}>{value}/10</Text>
+                        <View style={sStyles.feedbackHeader}>
+                          <Text style={sStyles.feedbackTitle}>Your Score</Text>
+                          <View
+                            style={[
+                              sStyles.scoreBadge,
+                              { backgroundColor: feedback.score >= 70 ? `${colors.success}26` : feedback.score >= 50 ? "#FEF3C720" : `${colors.danger}20` },
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                sStyles.scoreBadgeText,
+                                { color: feedback.score >= 70 ? colors.success : feedback.score >= 50 ? "#D97706" : colors.danger },
+                              ]}
+                            >
+                              {feedback.score}/100
                             </Text>
                           </View>
-                        ))}
-                      </View>
-                    ) : null}
-                  </AnimatedView>
-                )}
-              </View>
+                        </View>
+
+                        {feedback.transcription ? (
+                          <View style={sStyles.feedbackSection}>
+                            <Text style={sStyles.feedbackSectionLabel}>Captured Response</Text>
+                            <Text style={sStyles.feedbackBodyText}>{feedback.transcription}</Text>
+                          </View>
+                        ) : null}
+
+                        <View style={sStyles.feedbackSection}>
+                          <Text style={sStyles.feedbackSectionLabel}>Feedback</Text>
+                          <Text style={sStyles.feedbackBodyText}>{feedback.feedback}</Text>
+                        </View>
+
+                        {(feedback.strengths?.length ?? 0) > 0 || (feedback.improvements?.length ?? 0) > 0 ? (
+                          <View style={sStyles.feedbackSection}>
+                            {(feedback.strengths ?? []).slice(0, 2).map((item, idx) => (
+                              <View key={`s${idx}`} style={sStyles.strengthChip}>
+                                <Text style={sStyles.strengthLabel}>Strength</Text>
+                                <Text style={sStyles.strengthText}>{item}</Text>
+                              </View>
+                            ))}
+                            {(feedback.improvements ?? []).slice(0, 2).map((item, idx) => (
+                              <View key={`i${idx}`} style={sStyles.improvementChip}>
+                                <Text style={sStyles.improvementLabel}>Improve</Text>
+                                <Text style={sStyles.improvementText}>{item}</Text>
+                              </View>
+                            ))}
+                          </View>
+                        ) : null}
+
+                        <View style={sStyles.feedbackSection}>
+                          <Text style={sStyles.feedbackSectionLabel}>Ideal Answer</Text>
+                          <Text style={sStyles.feedbackBodyText}>{feedback.modelAnswer}</Text>
+                        </View>
+
+                        {Object.keys(feedback.criteriaScores).length > 0 ? (
+                          <View style={sStyles.criteriaRow}>
+                            {Object.entries(feedback.criteriaScores).map(([criterion, value]) => (
+                              <View key={criterion} style={sStyles.criteriaBadge}>
+                                <Text style={sStyles.criteriaText}>
+                                  {criterion.replace(/_/g, " ")}:{" "}
+                                  <Text style={sStyles.criteriaScore}>{value}/10</Text>
+                                </Text>
+                              </View>
+                            ))}
+                          </View>
+                        ) : null}
+                      </AnimatedView>
+                    )}
+                  </View>
+                </View>
+              </TouchableWithoutFeedback>
             </ScrollView>
 
             {/* Bottom action bar */}
@@ -1338,7 +1350,6 @@ export default function InterviewSessionScreen() {
               )}
             </View>
           </View>
-        </TouchableWithoutFeedback>
       </KeyboardAvoidingView>
     </SafeAreaView>
     </>

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { Image, Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity, View } from "react-native";
-import * as FileSystem from "expo-file-system";
+// expo-file-system v19+ moved readAsStringAsync/EncodingType to legacy sub-path.
+import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
 import { Ionicons } from "@expo/vector-icons";
 

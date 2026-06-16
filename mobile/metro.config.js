@@ -23,6 +23,25 @@ const workletsLib = path.resolve(
 
 const nativeWindResolve = finalConfig.resolver.resolveRequest;
 finalConfig.resolver.resolveRequest = (context, moduleName, platform) => {
+  // ── @firebase/app: force CJS build on native ─────────────────────────────
+  // @firebase/app ships no "react-native" field, so Metro falls back to
+  // "browser" → dist/esm/index.esm2017.js for ESM callers (e.g.
+  // firebase/app/dist/esm/index.esm.js) while CJS callers (e.g.
+  // @firebase/auth/dist/rn/index.js) get dist/index.cjs.js via "main".
+  // That produces two separate module instances with separate component
+  // registries, causing "Component auth has not been registered yet".
+  // This resolver override forces every require/import of @firebase/app on
+  // native to the CJS build so there is exactly one registry.
+  if (platform !== "web" && moduleName === "@firebase/app") {
+    return {
+      type: "sourceFile",
+      filePath: path.resolve(
+        __dirname,
+        "node_modules/@firebase/app/dist/index.cjs.js"
+      ),
+    };
+  }
+
   // Only intercept the root package import and known JS sub-paths.
   // Do NOT intercept `.json` imports (package.json), deep paths that already
   // include `lib/module/`, or the `plugin` sub-path (which is a Babel plugin

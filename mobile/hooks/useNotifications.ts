@@ -9,13 +9,21 @@
 import { useEffect, useRef } from "react";
 import { Platform } from "react-native";
 import * as Notifications from "expo-notifications";
+import Constants from "expo-constants";
 import { useRouter } from "expo-router";
 import * as registerService from "../services/notification.service";
 
+// expo-notifications removed remote push support from Expo Go in SDK 53.
+// Detect Expo Go so we can skip the getExpoPushTokenAsync call that would
+// log a noisy ERROR to the console even though the app still works.
+const isExpoGo = Constants.appOwnership === "expo";
+
 // Configure how notifications are handled while the app is in the foreground.
+// SDK 53 renamed shouldShowAlert → shouldShowBanner + shouldShowList.
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
+    shouldShowBanner: true,
+    shouldShowList: true,
     shouldPlaySound: true,
     shouldSetBadge: false,
   }),
@@ -56,6 +64,8 @@ async function scheduleDailyReminder(hour: number = 18) {
     }
   }
 
+  // SDK 53+ requires an explicit `type` field on every trigger.
+  // DailyTriggerInput fires once per day at the given hour:minute.
   await Notifications.scheduleNotificationAsync({
     content: {
       title: "📅 Daily Interview Prep",
@@ -64,10 +74,10 @@ async function scheduleDailyReminder(hour: number = 18) {
       sound: "default",
     },
     trigger: {
+      type: Notifications.SchedulableTriggerInputTypes.DAILY,
       hour,
       minute: 0,
-      repeats: true,
-    } as Notifications.CalendarTriggerInput,
+    } satisfies Notifications.DailyTriggerInput,
   });
 }
 
@@ -93,8 +103,10 @@ export function useNotifications() {
         }
         if (finalStatus !== "granted" || !isMounted) return;
 
-        // Obtain Expo push token (works on physical devices; silently fails on simulators).
-        if (Platform.OS !== "web") {
+        // Obtain Expo push token (works on physical devices in production builds).
+        // Skip in Expo Go — SDK 53 removed Android remote push support there and
+        // calling getExpoPushTokenAsync would log a noisy ERROR.
+        if (Platform.OS !== "web" && !isExpoGo) {
           const tokenData = await Notifications.getExpoPushTokenAsync({
             projectId: "c685ee8c-cb64-425a-bc94-f026fa70af9d",
           });

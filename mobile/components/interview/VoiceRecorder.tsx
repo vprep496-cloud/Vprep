@@ -21,7 +21,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Platform, StyleSheet, Text, TouchableOpacity, View } from "react-native";
 import { Audio, type AVPlaybackStatus } from "expo-av";
-import * as FileSystem from "expo-file-system";
+// expo-file-system v19+ moved readAsStringAsync/EncodingType to the legacy
+// sub-path. Importing from the main path gives stub functions that throw.
+import * as FileSystem from "expo-file-system/legacy";
 import { Ionicons } from "@expo/vector-icons";
 
 import { colors, shadows } from "../../constants/theme";
