@@ -8,7 +8,7 @@
  * height-measurement bugs). All spacing is via explicit marginBottom.
  */
 import { StyleSheet, Text, View } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { colors, shadows } from "../../constants/theme";
 
 // ─── Design tokens ────────────────────────────────────────────────────────────

@@ -29,7 +29,7 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import Toast from "react-native-toast-message";
 
 import * as enrollmentService from "../../services/enrollment.service";

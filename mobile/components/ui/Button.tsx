@@ -1,5 +1,5 @@
 import { TouchableOpacity, Text, ActivityIndicator, View } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { colors, shadows } from "../../constants/theme";
 import { tapHaptic } from "../../lib/haptics";
 

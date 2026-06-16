@@ -1,6 +1,6 @@
 import { Platform, StyleSheet, View } from "react-native";
 import { Tabs } from "expo-router";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { colors } from "../../constants/theme";
 import { useTokenRefresh } from "../../hooks/useTokenRefresh";
 import { useNotifications } from "../../hooks/useNotifications";

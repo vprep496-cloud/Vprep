@@ -3,7 +3,7 @@ import { RefreshControl, ScrollView, Text, TouchableOpacity, View } from "react-
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import AnimatedView from "../../components/ui/AnimatedView";
 import BrandedHeader from "../../components/ui/BrandedHeader";
 

@@ -3,7 +3,7 @@ import { Alert, Image, Platform, ScrollView, Text, TouchableOpacity, View } from
 import { SafeAreaView } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import * as WebBrowser from "expo-web-browser";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 import { LinearGradient } from "expo-linear-gradient";
 import Toast from "react-native-toast-message";
 import { getAuth, sendPasswordResetEmail } from "firebase/auth";

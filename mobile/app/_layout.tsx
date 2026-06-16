@@ -14,6 +14,9 @@ import {
   Montserrat_600SemiBold,
   Montserrat_700Bold,
 } from "@expo-google-fonts/montserrat";
+import Ionicons from "@expo/vector-icons/Ionicons";
+import AntDesign from "@expo/vector-icons/AntDesign";
+import MaterialIcons from "@expo/vector-icons/MaterialIcons";
 import { firebaseAuth } from "../lib/firebase";
 import { queryClient } from "../lib/queryClient";
 import { toastConfig } from "../lib/toastConfig";
@@ -158,6 +161,11 @@ export default function RootLayout() {
     Montserrat_500Medium,
     Montserrat_600SemiBold,
     Montserrat_700Bold,
+    // Load all vector icon fonts used in the app — Expo Go does not guarantee
+    // these are pre-bundled in SDK 54, so we load them explicitly via tunnel.
+    ...Ionicons.font,
+    ...AntDesign.font,
+    ...MaterialIcons.font,
   });
 
   if (!fontsLoaded) {

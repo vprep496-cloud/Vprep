@@ -3,7 +3,7 @@ import { Image, Modal, Platform, ScrollView, StyleSheet, Text, TouchableOpacity,
 // expo-file-system v19+ moved readAsStringAsync/EncodingType to legacy sub-path.
 import * as FileSystem from "expo-file-system/legacy";
 import * as ImagePicker from "expo-image-picker";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 
 import { colors } from "../../constants/theme";
 import { errorHaptic, tapHaptic } from "../../lib/haptics";

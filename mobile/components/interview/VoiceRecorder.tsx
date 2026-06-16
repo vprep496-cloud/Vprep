@@ -24,7 +24,7 @@ import { Audio, type AVPlaybackStatus } from "expo-av";
 // expo-file-system v19+ moved readAsStringAsync/EncodingType to the legacy
 // sub-path. Importing from the main path gives stub functions that throw.
 import * as FileSystem from "expo-file-system/legacy";
-import { Ionicons } from "@expo/vector-icons";
+import Ionicons from "@expo/vector-icons/Ionicons";
 
 import { colors, shadows } from "../../constants/theme";
 import { errorHaptic, successHaptic, tapHaptic } from "../../lib/haptics";
