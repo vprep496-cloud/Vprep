@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1066252591394",
+    "project_id": "vprep-c7450",
+    "storage_bucket": "vprep-c7450.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1066252591394:android:5d418f4329c158481bc57b",
+        "android_client_info": {
+          "package_name": "com.vprep.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCC4JcJsf2t5_HP_4GbKDQUg9vvrjN4Irs"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

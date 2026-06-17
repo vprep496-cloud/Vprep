@@ -19,7 +19,7 @@ const DEMO_ACCOUNTS = [
 type DemoKey = (typeof DEMO_ACCOUNTS)[number]["key"];
 
 export default function LoginScreen() {
-  const { signInWithGoogle, signInWithDemo, isSigningIn, error, request } = useAuth();
+  const { signInWithGoogle, signInWithDemo, isGoogleSignInAvailable, isSigningIn, error } = useAuth();
   const [demoLoading, setDemoLoading] = useState<DemoKey | null>(null);
   const [demoError, setDemoError] = useState<string | null>(null);
 
@@ -77,31 +77,37 @@ export default function LoginScreen() {
             </View>
           ) : null}
 
-          <TouchableOpacity
-            accessibilityRole="button"
-            accessibilityLabel="Continue with Google"
-            disabled={!request || isBusy}
-            onPress={handleGooglePress}
-            activeOpacity={0.86}
-            className="mt-8 h-16 flex-row items-center justify-center rounded-full bg-primary-500"
-            style={[shadows.card, !request || isBusy ? { opacity: 0.55 } : undefined]}
-          >
-            {isSigningIn && demoLoading === null ? (
-              <ActivityIndicator color="#FFFFFF" />
-            ) : (
-              <>
-                <AntDesign name="google" size={20} color="#FFFFFF" />
-                <Text className="ml-3 text-base font-bold text-text-inverse">Continue with Google</Text>
-                <Ionicons name="arrow-forward" size={22} color="#FFFFFF" style={{ marginLeft: 12 }} />
-              </>
-            )}
-          </TouchableOpacity>
+          {isGoogleSignInAvailable ? (
+            <>
+              <TouchableOpacity
+                accessibilityRole="button"
+                accessibilityLabel="Continue with Google"
+                disabled={isBusy}
+                onPress={handleGooglePress}
+                activeOpacity={0.86}
+                className="mt-8 h-16 flex-row items-center justify-center rounded-full bg-primary-500"
+                style={[shadows.card, isBusy ? { opacity: 0.72 } : undefined]}
+              >
+                {isSigningIn && demoLoading === null ? (
+                  <ActivityIndicator color="#FFFFFF" />
+                ) : (
+                  <>
+                    <AntDesign name="google" size={20} color="#FFFFFF" />
+                    <Text className="ml-3 text-base font-bold text-text-inverse">Continue with Google</Text>
+                    <Ionicons name="arrow-forward" size={22} color="#FFFFFF" style={{ marginLeft: 12 }} />
+                  </>
+                )}
+              </TouchableOpacity>
 
-          <View className="my-7 flex-row items-center gap-3">
-            <View className="h-px flex-1 bg-border-soft" />
-            <Text className="text-xs font-bold uppercase tracking-[3px] text-text-muted">Or use demo</Text>
-            <View className="h-px flex-1 bg-border-soft" />
-          </View>
+              <View className="my-7 flex-row items-center gap-3">
+                <View className="h-px flex-1 bg-border-soft" />
+                <Text className="text-xs font-bold uppercase tracking-[3px] text-text-muted">Or use demo</Text>
+                <View className="h-px flex-1 bg-border-soft" />
+              </View>
+            </>
+          ) : (
+            <View className="mt-8" />
+          )}
 
           <View className="flex-row flex-wrap gap-3">
             {DEMO_ACCOUNTS.map((account) => {

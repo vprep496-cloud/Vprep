@@ -4,8 +4,11 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "expo start --go",
-    "android": "expo start --android",
+    "start": "node scripts/start-expo-lan.js",
+    "android": "node scripts/start-expo-lan.js",
+    "android:emulator": "expo start --android",
+    "dev-client": "node scripts/start-expo-lan.js --dev-client",
+    "tunnel": "expo start --go --tunnel",
     "ios": "expo start --ios",
     "web": "expo start --web",
     "lint": "expo lint",

@@ -1,6 +1,8 @@
-import { useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Platform } from "react-native";
 import * as AuthSession from "expo-auth-session";
 import * as WebBrowser from "expo-web-browser";
+import Constants, { ExecutionEnvironment } from "expo-constants";
 import {
   GoogleAuthProvider,
   signInWithCredential,
@@ -9,8 +11,6 @@ import {
 import { firebaseAuth } from "../lib/firebase";
 import { useAuthStore } from "../stores/auth.store";
 import { syncUser } from "../services/auth.service";
-// Use the shared api instance so the snake→camelCase interceptor is applied
-// to demo-login responses automatically.
 import api from "../services/api";
 import { useAppStore } from "../stores/app.store";
 import { getEnrollments } from "../services/enrollment.service";
@@ -18,13 +18,77 @@ import { unregisterPushToken } from "../services/notification.service";
 
 WebBrowser.maybeCompleteAuthSession();
 
-// Google's OAuth 2.0 discovery document — used directly with AuthSession so we
-// stay on the generic AuthRequest API rather than a provider-specific helper.
+const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreClient;
+const GOOGLE_OAUTH_SCHEME = "com.vprep.app";
+const GOOGLE_OAUTH_REDIRECT_PATH = "oauthredirect";
+const GOOGLE_OAUTH_NATIVE_REDIRECT_URI = `${GOOGLE_OAUTH_SCHEME}:/${GOOGLE_OAUTH_REDIRECT_PATH}`;
+const EXPO_GOOGLE_PROXY_REDIRECT_URI = "https://auth.expo.io/@vprep/vprep";
+const GOOGLE_SCOPES = ["openid", "profile", "email"];
+
 const googleDiscovery: AuthSession.DiscoveryDocument = {
   authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
   tokenEndpoint: "https://oauth2.googleapis.com/token",
   revocationEndpoint: "https://oauth2.googleapis.com/revoke",
 };
+
+function readPublicEnv(name: string): string | undefined {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+function getGoogleClientConfig() {
+  const androidClientId = readPublicEnv("EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID");
+  const iosClientId = readPublicEnv("EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID");
+  const webClientId =
+    readPublicEnv("EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID") ??
+    readPublicEnv("EXPO_PUBLIC_GOOGLE_CLIENT_ID");
+
+  if (isExpoGo) {
+    return {
+      clientId: webClientId,
+      envName: "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID",
+      label: "Expo Go Web",
+    };
+  }
+
+  if (Platform.OS === "android") {
+    return {
+      clientId: androidClientId,
+      envName: "EXPO_PUBLIC_GOOGLE_ANDROID_CLIENT_ID",
+      label: "Android",
+    };
+  }
+
+  if (Platform.OS === "ios") {
+    return {
+      clientId: iosClientId,
+      envName: "EXPO_PUBLIC_GOOGLE_IOS_CLIENT_ID",
+      label: "iOS",
+    };
+  }
+
+  return {
+    clientId: webClientId,
+    envName: "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID",
+    label: "Web",
+  };
+}
+
+function getIdTokenFromUrl(url: string): string | undefined {
+  const queryStart = url.indexOf("?");
+  const hashStart = url.indexOf("#");
+  let params = "";
+
+  if (queryStart !== -1) {
+    params += url.slice(queryStart + 1, hashStart !== -1 ? hashStart : url.length);
+  }
+  if (hashStart !== -1) {
+    if (params) params += "&";
+    params += url.slice(hashStart + 1);
+  }
+
+  return new URLSearchParams(params).get("id_token") ?? undefined;
+}
 
 export function useAuth() {
   const [isSigningIn, setIsSigningIn] = useState(false);
@@ -35,37 +99,56 @@ export function useAuth() {
   const logout = useAuthStore((s) => s.logout);
   const setEnrollments = useAppStore((s) => s.setEnrollments);
 
-  // makeRedirectUri behaviour:
-  //   native build  → "vprep://"           (deep-link, registered in Google Console as iOS/Android client)
-  //   Expo web dev  → "http://localhost:PORT" derived from window.location
-  //   Expo Go       → "exp://localhost:PORT"
-  // The exact URI logged below must be added to your Google Cloud Console
-  // OAuth 2.0 Web Client → Authorized redirect URIs AND JavaScript origins.
-  const redirectUri = AuthSession.makeRedirectUri({
-    scheme: "vprep",
-    // preferLocalhost avoids "127.0.0.1" vs "localhost" mismatch in dev
-    preferLocalhost: true,
-  });
-  // DEV ONLY — copy this to Google Cloud Console
-  if (__DEV__) console.log("[useAuth] Google redirect URI:", redirectUri);
-
-  // Stable nonce: generated once per hook mount, never on re-render.
-  // Math.random() inside useAuthRequest options was generating a new nonce
-  // on every render, causing useAuthRequest to detect changed options every
-  // render, set internal state, and trigger another render — an infinite
-  // re-render loop that blocked the JS thread on the first click.
   const nonceRef = useRef(Math.random().toString(36).substring(2));
+  const googleClient = useMemo(() => getGoogleClientConfig(), []);
+  const appReturnUri = useMemo(
+    () =>
+      AuthSession.makeRedirectUri({
+        native: GOOGLE_OAUTH_NATIVE_REDIRECT_URI,
+        scheme: GOOGLE_OAUTH_SCHEME,
+        path: GOOGLE_OAUTH_REDIRECT_PATH,
+      }),
+    []
+  );
+  const authorizationRedirectUri = isExpoGo ? EXPO_GOOGLE_PROXY_REDIRECT_URI : appReturnUri;
+
+  const googleConfigError = useMemo(() => {
+    if (!isExpoGo && authorizationRedirectUri.startsWith("exp://")) {
+      return `Google sign-in generated ${authorizationRedirectUri}. Rebuild the app so the native ${GOOGLE_OAUTH_SCHEME} scheme is installed.`;
+    }
+
+    if (!googleClient.clientId) {
+      return `Missing ${googleClient.envName}. Add the ${googleClient.label} OAuth client ID to your mobile environment.`;
+    }
+
+    return null;
+  }, [googleClient, authorizationRedirectUri]);
+
+  useEffect(() => {
+    if (!__DEV__) return;
+    console.log("[useAuth] Google OAuth redirect URI:", authorizationRedirectUri);
+    console.log("[useAuth] Google OAuth app return URI:", appReturnUri);
+    console.log("[useAuth] Google OAuth client env:", googleClient.envName);
+  }, [appReturnUri, authorizationRedirectUri, googleClient.envName]);
+
+  const isWebAuth = Platform.OS === "web";
+  const usesImplicitIdTokenFlow = isExpoGo || isWebAuth;
 
   const [request, , promptAsync] = AuthSession.useAuthRequest(
     {
-      clientId: process.env.EXPO_PUBLIC_GOOGLE_CLIENT_ID ?? "",
-      scopes: ["openid", "profile", "email"],
-      redirectUri,
-      responseType: AuthSession.ResponseType.IdToken,
-      usePKCE: false,
-      extraParams: {
-        nonce: nonceRef.current,
-      },
+      clientId: googleClient.clientId ?? "missing-google-client-id",
+      scopes: GOOGLE_SCOPES,
+      redirectUri: authorizationRedirectUri,
+      responseType: usesImplicitIdTokenFlow
+        ? AuthSession.ResponseType.IdToken
+        : AuthSession.ResponseType.Code,
+      usePKCE: !usesImplicitIdTokenFlow,
+      prompt: AuthSession.Prompt.SelectAccount,
+      extraParams: usesImplicitIdTokenFlow
+        ? {
+            nonce: nonceRef.current,
+          }
+        : undefined,
     },
     googleDiscovery
   );
@@ -74,16 +157,63 @@ export function useAuth() {
     setError(null);
     setIsSigningIn(true);
     try {
-      const result = await promptAsync();
-
-      if (result.type !== "success") {
-        if (result.type === "error") {
-          setError(result.error?.message ?? "Google sign-in failed. Please try again.");
-        }
+      if (googleConfigError) {
         return;
       }
 
-      const idToken = result.params?.id_token;
+      if (!request || !request.url || !googleClient.clientId) {
+        return;
+      }
+
+      let idToken: string | undefined;
+
+      if (isExpoGo) {
+        const proxyStartUrl =
+          `${EXPO_GOOGLE_PROXY_REDIRECT_URI}/start?` +
+          new URLSearchParams({
+            authUrl: request.url ?? "",
+            returnUrl: appReturnUri,
+          }).toString();
+
+        const browserResult = await WebBrowser.openAuthSessionAsync(proxyStartUrl, appReturnUri);
+        if (browserResult.type !== "success") {
+          return;
+        }
+
+        idToken = getIdTokenFromUrl(browserResult.url);
+      } else {
+        const result = await promptAsync();
+        if (result.type !== "success") {
+          if (result.type === "error") {
+            setError(
+              result.params?.error_description ??
+                result.error?.message ??
+                "Google sign-in failed. Please try again."
+            );
+          }
+          return;
+        }
+
+        idToken = result.params?.id_token;
+        const authCode = result.params?.code;
+
+        if (!idToken && authCode) {
+          const tokenResponse = await AuthSession.exchangeCodeAsync(
+            {
+              clientId: googleClient.clientId,
+              code: authCode,
+              redirectUri: authorizationRedirectUri,
+              scopes: GOOGLE_SCOPES,
+              extraParams: {
+                code_verifier: request.codeVerifier ?? "",
+              },
+            },
+            googleDiscovery
+          );
+          idToken = tokenResponse.idToken;
+        }
+      }
+
       if (!idToken) {
         setError("Google did not return an ID token. Please try again.");
         return;
@@ -92,13 +222,12 @@ export function useAuth() {
       // Exchange the Google ID token for a Firebase credential/session.
       const credential = GoogleAuthProvider.credential(idToken);
       const userCredential = await signInWithCredential(firebaseAuth, credential);
-
-      // Always fetch a fresh Firebase ID token before persisting/calling the API.
       const firebaseIdToken = await userCredential.user.getIdToken(true);
       await setToken(firebaseIdToken);
 
       const backendUser = await syncUser();
       setUser(backendUser);
+
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Something went wrong while signing in.";
@@ -108,25 +237,17 @@ export function useAuth() {
     }
   };
 
-  // -------------------------------------------------------------------------
-  // Demo login — bypasses Firebase entirely; calls POST /auth/demo-login
-  // directly and stores the returned locally-signed JWT in SecureStore.
-  // -------------------------------------------------------------------------
+  // ── Demo login — bypasses Firebase entirely ─────────────────────────────────
   const signInWithDemo = async (accountKey: string) => {
     setError(null);
     setIsSigningIn(true);
     try {
-      // `api` applies the snake→camelCase interceptor, so `user` arrives with
-      // camelCase keys (displayName, firebaseUid, etc.) matching the User type.
       const response = await api.post("/api/v1/auth/demo-login", {
         account_key: accountKey,
       });
       const { token, user } = response.data;
       await setToken(token);
       setUser(user);
-      // Hydrate enrollment store immediately so the home screen shows real
-      // data (the _layout.tsx auth guard only loads enrollments via the
-      // Firebase onAuthStateChanged path, which never fires for demo login).
       try {
         const enrollments = await getEnrollments();
         setEnrollments(enrollments);
@@ -143,36 +264,28 @@ export function useAuth() {
   };
 
   const signOut = async () => {
-    // Step 1 — best-effort: remove the push token while we still have a valid
-    // auth token.  Non-fatal if it fails (device may not have a token).
     try {
       await unregisterPushToken();
     } catch {
       // ignore
     }
-
-    // Step 2 — clear our local session BEFORE calling firebaseSignOut.
-    //
-    // ⚠️  ORDER MATTERS: firebaseSignOut triggers onAuthStateChanged(null)
-    // immediately when it resolves.  The AuthGuard in _layout.tsx then reads
-    // the stored token from SecureStore; if the token is still present at that
-    // moment it calls getMe(), which may succeed (Firebase ID tokens remain
-    // valid for ~1 hour after sign-out), and the user is silently
-    // re-authenticated — making the sign-out button appear broken.
-    //
-    // Calling logout() first guarantees the token is gone before
-    // onAuthStateChanged ever fires.
+    // Clear local session BEFORE Firebase sign-out to prevent race condition
+    // where onAuthStateChanged fires with a still-valid stored token.
     await logout();
-
-    // Step 3 — sign out of Firebase.  If this throws, local session is already
-    // cleared so we suppress the error — the user cannot take further
-    // authenticated actions regardless.
     try {
       await firebaseSignOut(firebaseAuth);
     } catch {
-      // local session cleared; Firebase error is cosmetic
+      // local session already cleared; Firebase error is cosmetic
     }
   };
 
-  return { signInWithGoogle, signInWithDemo, signOut, request, isSigningIn, error };
+  return {
+    signInWithGoogle,
+    signInWithDemo,
+    signOut,
+    isGoogleSignInAvailable: !googleConfigError,
+    request,
+    isSigningIn,
+    error,
+  };
 }
