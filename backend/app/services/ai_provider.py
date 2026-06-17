@@ -904,15 +904,15 @@ def _compute_audio_features(segments: list, info: Any, transcript: str = "") -> 
     if total_words == 0:
         return AudioFeatures(
             total_words=0,
-            speaking_duration_seconds=total_duration,
-            silence_duration_seconds=0.0,
-            speaking_ratio=1.0,
+            speaking_duration_seconds=0.0,
+            silence_duration_seconds=round(total_duration, 1),
+            speaking_ratio=0.0,
             words_per_minute=0.0,
             filler_word_count=0,
             filler_word_ratio=0.0,
             pause_count=0,
-            avg_word_confidence=0.5,
-            delivery_score=50,
+            avg_word_confidence=0.0,
+            delivery_score=0,
             # linguistic defaults — neutral, can't compute without words
             vocabulary_richness=0.6,
             hedging_ratio=0.0,
@@ -1022,7 +1022,7 @@ def _transcribe_audio(media_bytes: bytes, mime_type: str) -> str:
             vad_filter=True,
             language="en",
             word_timestamps=False,
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,
         )
         # Consume the generator — segments are lazy
         transcript = " ".join(seg.text.strip() for seg in segments if seg.text.strip())
@@ -1097,7 +1097,7 @@ def _transcribe_with_features(media_bytes: bytes, mime_type: str) -> "tuple[str,
             vad_filter=True,
             language="en",
             word_timestamps=True,           # enables per-word timing + confidence
-            condition_on_previous_text=True,
+            condition_on_previous_text=False,
         )
         # Materialise the lazy generator — must iterate twice (text + features)
         segments = list(segments_gen)

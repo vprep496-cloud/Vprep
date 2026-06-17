@@ -1,6 +1,7 @@
 {
   "expo": {
     "name": "V-Prep",
+    "owner": "vprep",
     "slug": "vprep",
     "scheme": [
       "vprep",

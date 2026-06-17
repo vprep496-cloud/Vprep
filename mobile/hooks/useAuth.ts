@@ -3,6 +3,7 @@ import { Platform } from "react-native";
 import * as AuthSession from "expo-auth-session";
 import * as WebBrowser from "expo-web-browser";
 import Constants, { ExecutionEnvironment } from "expo-constants";
+import axios from "axios";
 import {
   GoogleAuthProvider,
   signInWithCredential,
@@ -15,6 +16,7 @@ import api from "../services/api";
 import { useAppStore } from "../stores/app.store";
 import { getEnrollments } from "../services/enrollment.service";
 import { unregisterPushToken } from "../services/notification.service";
+import { API_BASE_URL } from "../config/runtime";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -22,7 +24,6 @@ const isExpoGo = Constants.executionEnvironment === ExecutionEnvironment.StoreCl
 const GOOGLE_OAUTH_SCHEME = "com.vprep.app";
 const GOOGLE_OAUTH_REDIRECT_PATH = "oauthredirect";
 const GOOGLE_OAUTH_NATIVE_REDIRECT_URI = `${GOOGLE_OAUTH_SCHEME}:/${GOOGLE_OAUTH_REDIRECT_PATH}`;
-const EXPO_GOOGLE_PROXY_REDIRECT_URI = "https://auth.expo.io/@vprep/vprep";
 const GOOGLE_SCOPES = ["openid", "profile", "email"];
 
 const googleDiscovery: AuthSession.DiscoveryDocument = {
@@ -34,6 +35,20 @@ const googleDiscovery: AuthSession.DiscoveryDocument = {
 function readPublicEnv(name: string): string | undefined {
   const value = process.env[name]?.trim();
   return value ? value : undefined;
+}
+
+function getExpoAuthProxyRedirectUri() {
+  const explicitUri = readPublicEnv("EXPO_PUBLIC_EXPO_AUTH_PROXY_REDIRECT_URI");
+  if (explicitUri) return explicitUri;
+
+  const owner = readPublicEnv("EXPO_PUBLIC_EXPO_OWNER") ?? Constants.expoConfig?.owner;
+  const slug = readPublicEnv("EXPO_PUBLIC_EXPO_SLUG") ?? Constants.expoConfig?.slug;
+
+  if (owner && slug) {
+    return `https://auth.expo.io/@${owner.replace(/^@/, "")}/${slug}`;
+  }
+
+  return "https://auth.expo.io/@vprep/vprep";
 }
 
 function getGoogleClientConfig() {
@@ -101,6 +116,7 @@ export function useAuth() {
 
   const nonceRef = useRef(Math.random().toString(36).substring(2));
   const googleClient = useMemo(() => getGoogleClientConfig(), []);
+  const expoAuthProxyRedirectUri = useMemo(() => getExpoAuthProxyRedirectUri(), []);
   const appReturnUri = useMemo(
     () =>
       AuthSession.makeRedirectUri({
@@ -110,7 +126,7 @@ export function useAuth() {
       }),
     []
   );
-  const authorizationRedirectUri = isExpoGo ? EXPO_GOOGLE_PROXY_REDIRECT_URI : appReturnUri;
+  const authorizationRedirectUri = isExpoGo ? expoAuthProxyRedirectUri : appReturnUri;
 
   const googleConfigError = useMemo(() => {
     if (!isExpoGo && authorizationRedirectUri.startsWith("exp://")) {
@@ -129,6 +145,7 @@ export function useAuth() {
     console.log("[useAuth] Google OAuth redirect URI:", authorizationRedirectUri);
     console.log("[useAuth] Google OAuth app return URI:", appReturnUri);
     console.log("[useAuth] Google OAuth client env:", googleClient.envName);
+    console.log("[useAuth] API base URL:", API_BASE_URL);
   }, [appReturnUri, authorizationRedirectUri, googleClient.envName]);
 
   const isWebAuth = Platform.OS === "web";
@@ -169,7 +186,7 @@ export function useAuth() {
 
       if (isExpoGo) {
         const proxyStartUrl =
-          `${EXPO_GOOGLE_PROXY_REDIRECT_URI}/start?` +
+          `${expoAuthProxyRedirectUri}/start?` +
           new URLSearchParams({
             authUrl: request.url ?? "",
             returnUrl: appReturnUri,
@@ -229,8 +246,30 @@ export function useAuth() {
       setUser(backendUser);
 
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Something went wrong while signing in.";
+      await setToken(null);
+      try {
+        await firebaseSignOut(firebaseAuth);
+      } catch {
+        // Ignore cleanup failures; the original auth error is more useful.
+      }
+
+      if (axios.isAxiosError(err)) {
+        if (err.code === "ERR_NETWORK" || !err.response) {
+          setError(
+            `Google sign-in finished, but the backend is unreachable at ${API_BASE_URL}. Update EXPO_PUBLIC_API_URL to this laptop's LAN IP and make sure backend port 8000 is running.`
+          );
+          return;
+        }
+
+        if (err.response.status === 401 || err.response.status === 403) {
+          setError(
+            "Google sign-in finished, but the backend rejected the Firebase token. Make sure backend/firebase-service-account.json and the mobile Firebase env values are from the same Firebase project."
+          );
+          return;
+        }
+      }
+
+      const message = err instanceof Error ? err.message : "Something went wrong while signing in.";
       setError(message);
     } finally {
       setIsSigningIn(false);

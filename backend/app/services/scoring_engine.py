@@ -1,4 +1,5 @@
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -31,6 +32,51 @@ _JSON_ONLY_SUFFIX = (
 _RETRY_SUFFIX = (
     "\n\nYour previous response was not valid JSON or missed required fields. "
     "Output ONLY raw JSON this time, with every requested key present."
+)
+
+_MIN_VOICE_WORDS_FOR_SCORING = 8
+_MIN_VOICE_MEANINGFUL_WORDS = 5
+_MIN_VOICE_SPEAKING_SECONDS = 2.0
+_MIN_VOICE_SPEAKING_RATIO = 0.08
+_MIN_SHORT_TRANSCRIPT_CONFIDENCE = 0.35
+_LOW_VALUE_VOICE_TOKENS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "bye",
+        "for",
+        "hmm",
+        "i",
+        "is",
+        "it",
+        "music",
+        "ok",
+        "okay",
+        "please",
+        "so",
+        "thanks",
+        "thank",
+        "the",
+        "to",
+        "uh",
+        "um",
+        "you",
+    }
+)
+_COMMON_SILENCE_HALLUCINATIONS = frozenset(
+    {
+        "thank you",
+        "thanks",
+        "thanks for watching",
+        "thank you for watching",
+        "you",
+        "bye",
+        "goodbye",
+        "okay",
+        "ok",
+        "music",
+    }
 )
 
 
@@ -1252,6 +1298,121 @@ def _audio_metrics_context(features: AudioFeatures) -> str:
     )
 
 
+def _audio_metrics_dict(features: AudioFeatures) -> dict[str, Any]:
+    return {
+        "words_per_minute": features.words_per_minute,
+        "filler_word_count": features.filler_word_count,
+        "filler_word_ratio_pct": round(features.filler_word_ratio * 100, 1),
+        "speaking_ratio_pct": round(features.speaking_ratio * 100, 1),
+        "total_words": features.total_words,
+        "pause_count": features.pause_count,
+        "speaking_duration_seconds": features.speaking_duration_seconds,
+        "avg_word_confidence_pct": round(features.avg_word_confidence * 100, 1),
+        "vocabulary_richness_pct": round(features.vocabulary_richness * 100, 1),
+        "hedging_ratio_pct": round(features.hedging_ratio * 100, 1),
+        "specificity_score": features.specificity_score,
+        "ownership_score": features.ownership_score,
+        "star_signals": features.star_signals,
+    }
+
+
+def _voice_transcript_quality_problem(transcript: str, features: AudioFeatures) -> str | None:
+    """Return a machine flag when Whisper output should not be scored.
+
+    Whisper can hallucinate tiny boilerplate phrases from background noise or
+    silence. A duration check alone is not enough; reject transcripts that do
+    not contain enough confident, meaningful speech for interview scoring.
+    """
+    normalized = re.sub(r"[^a-z0-9\s]", " ", (transcript or "").lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    tokens = normalized.split()
+    meaningful_tokens = [
+        token
+        for token in tokens
+        if token not in _LOW_VALUE_VOICE_TOKENS and len(token) > 2
+    ]
+
+    if not normalized or features.total_words == 0:
+        return "no_speech_detected"
+    if normalized in _COMMON_SILENCE_HALLUCINATIONS:
+        return "likely_silence_hallucination"
+    if len(set(tokens)) <= 2 and all(token in _LOW_VALUE_VOICE_TOKENS for token in tokens):
+        return "likely_silence_hallucination"
+    if features.total_words < _MIN_VOICE_WORDS_FOR_SCORING:
+        return "answer_too_short_for_voice_scoring"
+    if len(meaningful_tokens) < _MIN_VOICE_MEANINGFUL_WORDS:
+        return "not_enough_meaningful_speech"
+    if features.speaking_duration_seconds < _MIN_VOICE_SPEAKING_SECONDS:
+        return "speech_too_short"
+    if (
+        features.speaking_ratio < _MIN_VOICE_SPEAKING_RATIO
+        and features.total_words < (_MIN_VOICE_WORDS_FOR_SCORING * 2)
+    ):
+        return "too_much_silence"
+    if (
+        features.avg_word_confidence < _MIN_SHORT_TRANSCRIPT_CONFIDENCE
+        and features.total_words < 20
+    ):
+        return "low_confidence_transcript"
+    return None
+
+
+def _insufficient_voice_result(
+    *,
+    transcript: str,
+    features: AudioFeatures,
+    criteria: list[Criterion],
+    mode: ScoreMode,
+    model_answer: str,
+    duration_seconds: int | None,
+    problem_flag: str,
+) -> dict[str, Any]:
+    criteria_scores = {criterion.key: 0 for criterion in criteria}
+    flags = sorted(
+        {
+            problem_flag,
+            "insufficient_speech",
+            "manual_review_recommended",
+            "very_low_score",
+        }
+    )
+    feedback = (
+        "We could not detect enough clear speech to score this answer. "
+        "Please re-record in a quieter place and speak a complete answer for at least a few sentences."
+    )
+    metadata = {
+        "rubric_version": RUBRIC_VERSION,
+        "scoring_mode": f"{mode}_insufficient_speech",
+        "raw_model_overall_score": 0,
+        "calibrated_overall_score": 0,
+        "confidence": 0.0,
+        "criteria_weights": {criterion.key: criterion.weight for criterion in criteria},
+        "review_flags": flags,
+        "evidence": [],
+        "score_rationale": "The recording did not contain enough clear speech for reliable scoring.",
+        "media_duration_seconds": duration_seconds,
+        "provider": "whisper_validation",
+        "audio_metrics": _audio_metrics_dict(features),
+        "raw_transcription": transcript,
+    }
+    return {
+        "overall_score": 0,
+        "criteria_scores": criteria_scores,
+        "confidence": 0.0,
+        "strengths": [],
+        "improvements": ["Record a complete spoken answer with clear speech before submitting."],
+        "review_flags": flags,
+        "evidence": [],
+        "score_rationale": "The recording did not contain enough clear speech for reliable scoring.",
+        "feedback": feedback,
+        "model_answer": model_answer,
+        "transcription": "",
+        "rubric_version": RUBRIC_VERSION,
+        "scoring_mode": f"{mode}_insufficient_speech",
+        "scoring_metadata": metadata,
+    }
+
+
 def _make_transcription_only_fallback(
     *,
     transcript: str,
@@ -1278,18 +1439,7 @@ def _make_transcription_only_fallback(
             "weights": {"content_communication": 0.85, "delivery": 0.15},
         },
         "audio_metrics": {
-            "words_per_minute": features.words_per_minute,
-            "filler_word_count": features.filler_word_count,
-            "filler_word_ratio_pct": round(features.filler_word_ratio * 100, 1),
-            "speaking_ratio_pct": round(features.speaking_ratio * 100, 1),
-            "total_words": features.total_words,
-            "pause_count": features.pause_count,
-            "speaking_duration_seconds": features.speaking_duration_seconds,
-            "vocabulary_richness_pct": round(features.vocabulary_richness * 100, 1),
-            "hedging_ratio_pct": round(features.hedging_ratio * 100, 1),
-            "specificity_score": features.specificity_score,
-            "ownership_score": features.ownership_score,
-            "star_signals": features.star_signals,
+            **_audio_metrics_dict(features),
         },
         "review_flags": flags,
         "media_duration_seconds": duration_seconds,
@@ -1357,6 +1507,18 @@ async def score_interview_audio(
             )
         raise
 
+    quality_problem = _voice_transcript_quality_problem(transcript, features)
+    if quality_problem:
+        return _insufficient_voice_result(
+            transcript=transcript,
+            features=features,
+            criteria=criteria,
+            mode=mode,
+            model_answer=question.get("model_answer", ""),
+            duration_seconds=duration_seconds,
+            problem_flag=quality_problem,
+        )
+
     # ── Step 2: Build enhanced prompt with audio metrics + embedded transcript ─
     audio_ctx = _audio_metrics_context(features)
     prompt_body = _build_interview_prompt(
@@ -1418,24 +1580,7 @@ async def score_interview_audio(
         "composite_score": composite,
         "weights": {"content_communication": 0.85, "delivery": 0.15},
     }
-    meta["audio_metrics"] = {
-        # ── Core delivery metrics ─────────────────────────────────────────────
-        "words_per_minute": features.words_per_minute,
-        "filler_word_count": features.filler_word_count,
-        "filler_word_ratio_pct": round(features.filler_word_ratio * 100, 1),
-        "speaking_ratio_pct": round(features.speaking_ratio * 100, 1),
-        "total_words": features.total_words,
-        "pause_count": features.pause_count,
-        "speaking_duration_seconds": features.speaking_duration_seconds,
-        "avg_word_confidence_pct": round(features.avg_word_confidence * 100, 1),
-        # ── Linguistic quality signals ────────────────────────────────────────
-        "vocabulary_richness_pct": round(features.vocabulary_richness * 100, 1),
-        "hedging_ratio_pct": round(features.hedging_ratio * 100, 1),
-        "specificity_score": features.specificity_score,
-        "ownership_score": features.ownership_score,
-        # ── STAR structural signals (rule-based + LLM combined) ───────────────
-        "star_signals": features.star_signals,  # rule-based phrase detection
-    }
+    meta["audio_metrics"] = _audio_metrics_dict(features)
     meta["provider"] = "whisper+ollama"
     result["scoring_metadata"] = meta
 

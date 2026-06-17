@@ -372,6 +372,9 @@ function AnswerAccordionItem({ answer, index, expanded, onToggle }: AnswerAccord
     answer.codingScoreStatus === "processing" ||
     answer.voiceScoreStatus === "pending" ||
     answer.voiceScoreStatus === "processing";
+  const isFailed =
+    answer.codingScoreStatus === "failed" ||
+    answer.voiceScoreStatus === "failed";
   const badge = isPending ? null : scoreBadgeMeta(answer.score);
 
   const handleToggle = () => {
@@ -401,6 +404,10 @@ function AnswerAccordionItem({ answer, index, expanded, onToggle }: AnswerAccord
           {isPending ? (
             <View className="rounded-full px-3 py-1 bg-warning/15">
               <Text className="text-xs font-bold text-warning">Scoring…</Text>
+            </View>
+          ) : isFailed ? (
+            <View className="rounded-full px-3 py-1 bg-warning/15">
+              <Text className="text-xs font-bold text-warning">Review needed</Text>
             </View>
           ) : badge ? (
             <View className={`rounded-full px-3 py-1 ${badge.container}`}>

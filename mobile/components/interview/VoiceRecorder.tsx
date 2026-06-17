@@ -34,6 +34,11 @@ export interface VoiceRecordingValue {
   base64: string;
   durationSeconds: number;
   audioFormat: string;   // "m4a" | "webm" | "wav" — passed to backend MIME mapper
+  voiceActivity?: {
+    activeSampleRatio: number;
+    peakDb: number;
+    averageDb: number;
+  };
 }
 
 interface VoiceRecorderProps {
@@ -51,12 +56,42 @@ const DEFAULT_MAX_SEC = 180;
 const ACCENT = colors.secondary;        // cranberry red — "live" colour
 const SUCCESS_COL = colors.success;
 const MUTED = colors.text.muted;
+const MIN_METERING_SAMPLES = 4;
+const ACTIVE_SPEECH_DB = -52;
+const MIN_PEAK_SPEECH_DB = -50;
+const MIN_ACTIVE_SAMPLE_RATIO = 0.06;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function formatDuration(totalSeconds: number): string {
   const m = Math.floor(totalSeconds / 60);
   const s = totalSeconds % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function analyseVoiceActivity(samples: number[]) {
+  const valid = samples.filter((value) => Number.isFinite(value) && value > -160 && value <= 0);
+  if (samples.length === 0) {
+    return { sampleCount: 0, activeSampleRatio: 1, peakDb: 0, averageDb: 0 };
+  }
+  if (valid.length === 0) {
+    return { sampleCount: samples.length, activeSampleRatio: 0, peakDb: -160, averageDb: -160 };
+  }
+
+  const activeSamples = valid.filter((value) => value >= ACTIVE_SPEECH_DB);
+  const peakDb = Math.max(...valid);
+  const averageDb = valid.reduce((sum, value) => sum + value, 0) / valid.length;
+
+  return {
+    sampleCount: valid.length,
+    activeSampleRatio: activeSamples.length / valid.length,
+    peakDb,
+    averageDb,
+  };
+}
+
+function hasEnoughMeteredSpeech(stats: ReturnType<typeof analyseVoiceActivity>): boolean {
+  if (stats.sampleCount < MIN_METERING_SAMPLES) return true;
+  return stats.peakDb >= MIN_PEAK_SPEECH_DB && stats.activeSampleRatio >= MIN_ACTIVE_SAMPLE_RATIO;
 }
 
 /**
@@ -149,9 +184,15 @@ export default function VoiceRecorder({
   const timerRef       = useRef<ReturnType<typeof setInterval> | null>(null);
   const elapsedRef     = useRef(0);
   const stopRef        = useRef<(() => Promise<void>) | null>(null);
+  const meteringSamplesRef = useRef<number[]>([]);
 
   const clearTimer = useCallback(() => {
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+  }, []);
+
+  const handleRecordingStatus = useCallback((status: { isRecording?: boolean; metering?: number }) => {
+    if (!status.isRecording || typeof status.metering !== "number") return;
+    meteringSamplesRef.current.push(status.metering);
   }, []);
 
   // Cleanup on unmount
@@ -179,9 +220,12 @@ export default function VoiceRecorder({
       setIsPlaying(false);
 
       const { recording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY
+        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        handleRecordingStatus,
+        250
       );
       recordingRef.current = recording;
+      meteringSamplesRef.current = [];
       setElapsed(0);
       elapsedRef.current = 0;
       setRecState("recording");
@@ -202,7 +246,7 @@ export default function VoiceRecorder({
       errorHaptic();
       setError("Couldn't start the microphone. Please refresh the page and try again.");
     }
-  }, [clearTimer, maxSeconds]);
+  }, [clearTimer, handleRecordingStatus, maxSeconds]);
 
   // ── Stop recording ───────────────────────────────────────────────────────────
   const stopRecording = useCallback(async () => {
@@ -225,6 +269,17 @@ export default function VoiceRecorder({
       if (finalDuration < minSeconds) {
         errorHaptic();
         setError(`Please record at least ${minSeconds} seconds. You recorded ${finalDuration}s.`);
+        setElapsed(0);
+        elapsedRef.current = 0;
+        setRecState("idle");
+        onRecordingChange(null);
+        return;
+      }
+
+      const voiceActivity = analyseVoiceActivity(meteringSamplesRef.current);
+      if (!hasEnoughMeteredSpeech(voiceActivity)) {
+        errorHaptic();
+        setError("I couldn't detect enough voice in that recording. Please re-record and speak clearly near the microphone.");
         setElapsed(0);
         elapsedRef.current = 0;
         setRecState("idle");
@@ -258,7 +313,16 @@ export default function VoiceRecorder({
       setCapturedUri(uri);
       setRecState("recorded");
       successHaptic();
-      onRecordingChange({ base64, durationSeconds: finalDuration, audioFormat });
+      onRecordingChange({
+        base64,
+        durationSeconds: finalDuration,
+        audioFormat,
+        voiceActivity: {
+          activeSampleRatio: voiceActivity.activeSampleRatio,
+          peakDb: voiceActivity.peakDb,
+          averageDb: voiceActivity.averageDb,
+        },
+      });
     } catch (err) {
       console.error("[VoiceRecorder] stop/process failed:", err);
       errorHaptic();

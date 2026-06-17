@@ -561,6 +561,7 @@ async def score_voice_answer(
                         vad_filter=True,
                         language="en",
                         word_timestamps=False,
+                        condition_on_previous_text=False,
                     )
                     return " ".join(seg.text.strip() for seg in segments if seg.text.strip()).strip()
                 finally:
@@ -1221,6 +1222,12 @@ async def _score_voice_answer_background(
             )
 
             review_flags = sorted(set(list(scored.get("review_flags", [])) + answer.get("review_flags", [])))
+            if "ai_scoring_unavailable" in review_flags:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="AI voice scoring is temporarily unavailable.",
+                )
+
             scoring_metadata = dict(scored.get("scoring_metadata") or {})
             scoring_metadata["review_flags"] = review_flags
             final_score = max(0, min(int(scored.get("overall_score", 0)), 100))
@@ -1302,6 +1309,10 @@ async def _score_voice_answer_background(
             {"$set": {
                 "answers.$.voice_score_status": "failed",
                 "answers.$.feedback": "Automatic scoring failed. Our team will review your submission manually.",
+                "answers.$.review_flags": ["ai_scoring_unavailable", "manual_review_recommended"],
+                "answers.$.ai_review_flags": ["ai_scoring_unavailable", "manual_review_recommended"],
+                "answers.$.score_rationale": "Automatic voice scoring was unavailable after multiple attempts.",
+                "answers.$.scoring_mode": "voice_scoring_failed",
                 "answers.$.manual_review_status": "pending",
             }},
         )
