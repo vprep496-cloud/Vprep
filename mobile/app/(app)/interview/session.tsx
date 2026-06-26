@@ -42,13 +42,16 @@ import { errorHaptic, successHaptic, tapHaptic } from "../../../lib/haptics";
 
 // ─── State machine ──────────────────────────────────────────────────────────
 type ScreenState = "loading" | "phase_intro" | "answering" | "phase_transition" | "completing";
+type UploadProgress = { current: number; total: number; kind: "coding" | "voice" };
 
 const MIN_TEXT_ANSWER_CHARS = 20;
 
 function backendErrorMessage(error: unknown, fallback: string): string {
   const detail = (error as { response?: { data?: { detail?: string } } } | undefined)
     ?.response?.data?.detail;
-  return typeof detail === "string" && detail.length > 0 ? detail : fallback;
+  if (typeof detail === "string" && detail.length > 0) return detail;
+  if (error instanceof Error && error.message.length > 0) return error.message;
+  return fallback;
 }
 
 // ─── Progress dots ──────────────────────────────────────────────────────────
@@ -154,6 +157,38 @@ function CodingProcessingBanner({
         </Text>
         <Ionicons name="arrow-forward" size={16} color={colors.primary[500]} />
       </TouchableOpacity>
+    </AnimatedView>
+  );
+}
+
+function CodingUploadStatusCard({
+  uploading,
+  failed,
+}: {
+  uploading: boolean;
+  failed: boolean;
+}) {
+  const tone = failed ? colors.danger : uploading ? colors.secondary : colors.success;
+  const icon = failed ? "alert-circle-outline" : uploading ? "cloud-upload-outline" : "checkmark-circle";
+  const title = failed ? "Upload needs retry" : uploading ? "Uploading in background" : "Coding answer queued";
+  const body = failed
+    ? "The image upload did not finish. Retake or re-submit the solution before completing the interview."
+    : uploading
+      ? "You can keep using the app. We will start AI scoring as soon as the image reaches the server."
+      : "The server has received your answer and AI scoring is running in the background.";
+
+  return (
+    <AnimatedView
+      from={{ opacity: 0, translateY: 8 }}
+      animate={{ opacity: 1, translateY: 0 }}
+      transition={{ type: "timing", duration: 260 }}
+      style={[sStyles.codingStatusCard, { borderColor: `${tone}30`, backgroundColor: `${tone}10` }]}
+    >
+      <Ionicons name={icon as any} size={20} color={tone} />
+      <View style={sStyles.codingStatusText}>
+        <Text style={[sStyles.codingStatusTitle, { color: tone }]}>{title}</Text>
+        <Text style={sStyles.codingStatusBody}>{body}</Text>
+      </View>
     </AnimatedView>
   );
 }
@@ -330,8 +365,15 @@ export default function InterviewSessionScreen() {
   const [pendingVoiceAnswers, setPendingVoiceAnswers] = useState<Record<string, VoiceRecordingValue>>({});
   // Tracks which voice answers were already uploaded — survives "Try Again" retries.
   const uploadedVoiceIds = useRef<Set<string>>(new Set());
-  // Upload progress shown on the "completing" screen while uploading recordings.
-  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
+  // Coding images upload in the background as soon as the candidate submits
+  // them. If the user finishes immediately, completion waits for these uploads.
+  const pendingCodingUploads = useRef<Map<string, Promise<boolean>>>(new Map());
+  const uploadedCodingIds = useRef<Set<string>>(new Set());
+  const failedCodingUploadIds = useRef<Set<string>>(new Set());
+  const [pendingCodingUploadIds, setPendingCodingUploadIds] = useState<Set<string>>(new Set());
+  const [failedCodingUploadIdState, setFailedCodingUploadIdState] = useState<Set<string>>(new Set());
+  // Upload progress shown on the "completing" screen while uploads finish.
+  const [uploadProgress, setUploadProgress] = useState<UploadProgress | null>(null);
 
   // Skip / answer tracking — per phase
   // Per-phase answered/skipped tracking — keyed by phase string so users can
@@ -356,6 +398,11 @@ export default function InterviewSessionScreen() {
       setCodingAck(null);
       setPendingVoiceAnswers({});
       uploadedVoiceIds.current = new Set();
+      pendingCodingUploads.current = new Map();
+      uploadedCodingIds.current = new Set();
+      failedCodingUploadIds.current = new Set();
+      setPendingCodingUploadIds(new Set());
+      setFailedCodingUploadIdState(new Set());
       setUploadProgress(null);
       setVoiceRecording(null);
       setImageAnswer(null);
@@ -551,6 +598,72 @@ export default function InterviewSessionScreen() {
     [questionIndex, phaseQuestions, pendingTextAnswers]
   );
 
+  const queueCodingImageUpload = useCallback(
+    (params: {
+      sessionId: string;
+      questionId: string;
+      answer: ImageAnswerValue;
+    }): Promise<boolean> => {
+      const { sessionId, questionId, answer } = params;
+
+      failedCodingUploadIds.current.delete(questionId);
+      setFailedCodingUploadIdState((prev) => {
+        const next = new Set(prev);
+        next.delete(questionId);
+        return next;
+      });
+      setPendingCodingUploadIds((prev) => new Set(prev).add(questionId));
+
+      const upload = interviewService
+        .submitCodingAnswerAsync({
+          sessionId,
+          questionId,
+          imageBase64: answer.base64,
+          imageMimeType: answer.mimeType,
+          imageWidth: answer.width,
+          imageHeight: answer.height,
+          imageSizeBytes: answer.sizeBytes,
+        })
+        .then(() => {
+          uploadedCodingIds.current.add(questionId);
+          Toast.show({
+            type: "success",
+            text1: "Coding image uploaded",
+            text2: "AI scoring is now running in the background.",
+          });
+          return true;
+        })
+        .catch((error) => {
+          console.error("[InterviewSession] coding background upload failed:", error);
+          failedCodingUploadIds.current.add(questionId);
+          setFailedCodingUploadIdState((prev) => new Set(prev).add(questionId));
+          setPhaseAnswered((prev) => {
+            const nextForCoding = new Set(prev.coding_logic ?? []);
+            nextForCoding.delete(questionId);
+            return { ...prev, coding_logic: nextForCoding };
+          });
+          Toast.show({
+            type: "error",
+            text1: "Coding upload failed",
+            text2: backendErrorMessage(error, "Please re-submit the image before finishing."),
+          });
+          return false;
+        })
+        .finally(() => {
+          pendingCodingUploads.current.delete(questionId);
+          setPendingCodingUploadIds((prev) => {
+            const next = new Set(prev);
+            next.delete(questionId);
+            return next;
+          });
+        });
+
+      pendingCodingUploads.current.set(questionId, upload);
+      return upload;
+    },
+    []
+  );
+
   // ─── Submit answer ────────────────────────────────────────────────────────
   const handleSubmitAnswer = useCallback(async () => {
     if (!session || !currentQuestion || !currentPhase || !canSubmit) return;
@@ -596,13 +709,18 @@ export default function InterviewSessionScreen() {
 
       setSubmitting(true);
       try {
-        await interviewService.submitTextAnswerBatch({
+        await interviewService.submitTextAnswerBatchAsync({
           sessionId: session.sessionId,
           phase: currentPhase,
           answers: textQuestions.map((q) => ({
             questionId: q.id,
             textAnswer: nextAnswers[q.id],
           })),
+        });
+        Toast.show({
+          type: "success",
+          text1: "Technical answers saved",
+          text2: "Scoring will finish in the background.",
         });
         setPendingTextAnswers({});
         setTextAnswer("");

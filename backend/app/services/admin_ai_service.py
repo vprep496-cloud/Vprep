@@ -15,17 +15,34 @@ _JSON_ONLY_SUFFIX = (
 _RETRY_SUFFIX = "\n\nYour previous response was not valid JSON. Output ONLY raw JSON this time."
 
 _DEFAULT_CRITERIA = {
-    "hr": ["clarity", "relevance", "fluency", "confidence"],
-    "technical": ["accuracy", "depth", "practical_knowledge"],
+    "hr": [
+        "communication_clarity",
+        "role_motivation",
+        "self_awareness",
+        "specificity",
+        "professionalism",
+    ],
+    "technical": [
+        "technical_correctness",
+        "depth_of_reasoning",
+        "practical_tradeoffs",
+        "implementation_awareness",
+        "terminology",
+    ],
     "coding_logic": [
-        "problem_understanding",
+        "problem_decomposition",
         "algorithm_correctness",
-        "implementation_quality",
         "edge_cases",
         "complexity_awareness",
-        "code_clarity",
+        "clarity",
     ],
-    "behavioral": ["structure", "example_quality", "self_awareness", "impact"],
+    "behavioral": [
+        "star_structure",
+        "ownership",
+        "impact",
+        "reflection",
+        "collaboration_judgment",
+    ],
 }
 
 # Algorithm categories used to diversify generated coding questions
@@ -101,11 +118,11 @@ def _build_question_prompt(
     topic_list = ", ".join(track.get("topic_areas") or ["general interview readiness"])
     criteria = _DEFAULT_CRITERIA[phase]
     difficulty_line = (
-        f"All questions should be {difficulty} difficulty."
+        f"All questions should be {difficulty} difficulty and calibrated to a real interview at that level."
         if difficulty
-        else "Use a healthy mix of easy, medium, and hard difficulty."
+        else "Use a balanced mix of easy, medium, and hard difficulty."
     )
-    guidance_line = f"\nAdditional admin guidance: {guidance}\n" if guidance else ""
+    guidance_line = f"\nProfessional generation guidance: {guidance}\n" if guidance else ""
 
     if phase == "coding_logic":
         return _build_coding_question_prompt(
@@ -120,16 +137,19 @@ def _build_question_prompt(
 
     phase_instructions = {
         "hr": (
-            "Generate HR voice-interview questions that assess communication, "
-            "clarity, motivation, self-awareness, and relevance to the role."
+            "Generate polished HR voice-interview questions that assess communication, "
+            "motivation, self-awareness, preparation, credibility, and role alignment. "
+            "Avoid generic filler unless it is framed with a professional follow-up."
         ),
         "technical": (
-            "Generate conceptual technical short-answer questions. They should "
-            "not require code, but they should reveal real understanding."
+            "Generate conceptual technical short-answer questions that do not require code, "
+            "but do reveal real understanding, tradeoff awareness, production thinking, "
+            "and the ability to explain decisions clearly."
         ),
         "behavioral": (
-            "Generate behavioral/culture-fit questions suitable for STAR-style "
-            "answers, with room for automated NLP scoring and manual review."
+            "Generate behavioral questions suitable for STAR-style answers. They should "
+            "probe ownership, judgment, communication, collaboration, learning, and impact "
+            "without sounding casual or vague."
         ),
     }[phase]
 
@@ -142,12 +162,18 @@ def _build_question_prompt(
         f"{phase_instructions}\n"
         f"{difficulty_line}\n"
         f"{guidance_line}\n"
+        "Quality rules:\n"
+        "- Write exactly one clear interviewer question per item.\n"
+        "- Make every question self-contained and specific to the track or role.\n"
+        "- Prefer realistic workplace scenarios, tradeoffs, diagnosis, or explanation tasks.\n"
+        "- Do not ask yes/no questions, trivia-only questions, or questions that reveal the answer.\n"
+        "- Do not mention scoring, rubrics, AI, V-Prep internals, or the model answer in the question text.\n\n"
         f"Generate exactly {count} questions. For every question provide:\n"
-        "- question_text: one realistic interviewer question or coding prompt\n"
+        "- question_text: one realistic interviewer question\n"
         "- difficulty: easy, medium, or hard\n"
         "- scoring_criteria: the exact criteria list to score, usually "
         f"{criteria}\n"
-        "- model_answer: a concise ideal answer/rubric used only after submission\n"
+        "- model_answer: a concise ideal answer or rubric used only after submission\n"
         "- tags: 2-5 lowercase tags\n\n"
         "Respond with a JSON object whose `questions` value is an array of "
         f"exactly {count} question objects, using exactly this schema:\n"
@@ -175,65 +201,61 @@ def _build_coding_question_prompt(
     guidance_line: str,
     criteria: list[str],
 ) -> str:
-    """Coding-specific question generation prompt — optimised for qwen2.5-coder.
-
-    Produces questions that are:
-      • Self-contained (no external libraries required)
-      • Solvable on paper in 15–30 minutes at the stated difficulty
-      • Accompanied by a model_answer that includes Big-O analysis
-      • Tagged with the algorithm category for the admin portal filter
-    """
+    """Coding-specific question generation prompt optimized for qwen2.5-coder."""
     categories_sample = ", ".join(_CODING_ALGORITHM_CATEGORIES[:8])
     return (
         "You are a senior software engineer building a professional coding assessment "
         "question bank for V-Prep, a mock interview platform.\n\n"
 
-        "═══ CONTEXT ═══\n"
+        "CONTEXT\n"
         f"Track: {track['name']}\n"
         f"Description: {track.get('description', '')}\n"
         f"Relevant topics: {topic_list}\n"
         f"{difficulty_line}\n"
         f"{guidance_line}\n"
 
-        "═══ QUESTION REQUIREMENTS ═══\n"
+        "QUESTION REQUIREMENTS\n"
         "Each coding question MUST:\n"
-        "1. Be solvable with pen-and-paper in 15–30 minutes at the stated difficulty.\n"
+        "1. Be solvable with pen-and-paper in 15-30 minutes at the stated difficulty.\n"
         "2. Specify clear input/output format and at least one concrete example.\n"
-        "3. Avoid requiring external libraries — standard language constructs only.\n"
+        "3. Avoid requiring external libraries; standard language constructs only.\n"
         "4. Cover one primary algorithm category per question for variety.\n"
-        "5. Be appropriate for the track's domain (e.g. a web-dev track should prefer "
-        "   string/array problems over graph algorithms).\n\n"
+        "5. Be appropriate for the track's domain and avoid random textbook prompts when a "
+        "domain-relevant data-processing problem would be better.\n"
+        "6. Ask the candidate to handwrite pseudocode or code and capture/upload the solution.\n\n"
+        "Professional quality rules:\n"
+        "- Use realistic engineering data and workflow context from the track.\n"
+        "- Do not create demo/toy prompts such as reversing strings, generic two-sum, or plain arrays with no domain context.\n"
+        "- The candidate should need to reason about validation, state, ordering, retries, caching, drift, routing, cost, sync, or similar professional concerns where relevant.\n"
+        "- The prompt must still be small enough to solve on paper; do not turn it into broad system design.\n\n"
 
         "Difficulty guide:\n"
-        "  easy   — basic array/string manipulation, linear scan, O(n) solutions.\n"
-        "           Example: 'reverse a string', 'find max in array'.\n"
-        "  medium — two-pointer, sliding window, hash map, binary search, simple recursion.\n"
-        "           Example: 'two sum', 'valid parentheses', 'longest substring without repeats'.\n"
-        "  hard   — DP, graph BFS/DFS, divide and conquer, multiple nested optimisations.\n"
-        "           Example: 'LCS', 'word break', 'number of islands'.\n\n"
+        "  easy   - one-pass validation, filtering, counting, or stable de-duplication with clear edge cases.\n"
+        "  medium - hash map, sliding window, queue, retry/backoff, merge, cache, or conflict-resolution logic.\n"
+        "  hard   - DP, graph traversal, circuit breaker, streaming summary, multi-step sync, or anomaly detection.\n\n"
 
         "Algorithm categories to rotate across questions:\n"
         f"  {categories_sample}, etc.\n\n"
 
-        "═══ MODEL ANSWER FORMAT ═══\n"
+        "MODEL ANSWER FORMAT\n"
         "model_answer must contain (in order):\n"
         "  1. Approach: one sentence describing the algorithm strategy.\n"
-        "  2. Code: clean Python or pseudocode solution (≤ 20 lines).\n"
+        "  2. Code: clean Python or pseudocode solution, 20 lines or fewer.\n"
         "  3. Complexity: 'Time: O(...) | Space: O(...)'\n"
-        "  4. Edge cases: 2–3 bullet points of boundary conditions to check.\n\n"
+        "  4. Edge cases: 2-3 boundary conditions to check.\n\n"
 
-        "═══ OUTPUT ═══\n"
+        "OUTPUT\n"
         f"Generate exactly {count} distinct coding questions. "
         "Use varied algorithm categories across the set.\n\n"
         "Respond with a JSON object using this exact schema:\n"
         "{\n"
         '  "questions": [\n'
         "    {\n"
-        '      "question_text": "Given an array of integers...",\n'
+        '      "question_text": "Handwrite pseudocode for an offline sync queue that stores failed mobile writes, retries them with backoff when connectivity returns, and prevents duplicate submissions. Include input/output, one example, time/space complexity, and edge cases.",\n'
         '      "difficulty": "medium",\n'
         f'      "scoring_criteria": {criteria},\n'
-        '      "model_answer": "Approach: sliding window...\\nCode:\\n  def fn(...):\\n    ...\\nTime: O(n) | Space: O(k)\\nEdge cases:\\n  - empty array: return 0",\n'
-        '      "tags": ["array", "sliding-window", "medium"]\n'
+        '      "model_answer": "Approach: persist operations with idempotency keys and retry metadata.\\nCode:\\n  def enqueue(op): ...\\n  def flush(queue): ...\\nComplexity: Time: O(n) | Space: O(n)\\nEdge cases:\\n  - duplicate idempotency key\\n  - permanent server failure\\n  - connectivity changes mid-flush",\n'
+        '      "tags": ["mobile-sync", "queue", "retry", "medium"]\n'
         "    }\n"
         "  ]\n"
         "}" + _JSON_ONLY_SUFFIX
@@ -316,6 +338,7 @@ async def generate_question_documents(
                 "scoring_criteria": scoring_criteria or _DEFAULT_CRITERIA[phase],
                 "model_answer": model_answer,
                 "tags": tags or [phase, track["id"]],
+                "is_active": True,
             }
         )
 

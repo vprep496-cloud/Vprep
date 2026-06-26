@@ -297,10 +297,14 @@ interface BackendAIStatus {
   sdk: string;
   endpoint?: string | null;
   models: {
+    default?: string;
     text: string;
     json: string;
-    scoring: string;
-    media_reasoning: string;
+    scoring?: string;
+    media_reasoning?: string;
+    scoring_voice_hr?: string;
+    scoring_coding?: string;
+    coding_model_active?: boolean;
   };
   generation: {
     temperature: number;
@@ -308,6 +312,8 @@ interface BackendAIStatus {
     top_p: number;
     max_output_tokens: number;
     request_timeout_seconds?: number;
+    coding_timeout_seconds?: number;
+    coding_num_ctx?: number;
   };
   media?: {
     image_ocr?: string;
@@ -318,6 +324,8 @@ interface BackendAIStatus {
     ok: boolean;
     message: string;
     available_models?: string[];
+    coding_model_ready?: boolean;
+    coding_model_warning?: string;
   };
 }
 
@@ -500,8 +508,12 @@ function toAIStatus(status: BackendAIStatus): AIStatus {
     sdk: status.sdk,
     endpoint: status.endpoint ?? null,
     models: {
+      default: status.models.default ?? status.models.text,
       text: status.models.text,
       json: status.models.json,
+      scoringVoiceHr: status.models.scoring_voice_hr ?? status.models.scoring ?? status.models.text,
+      scoringCoding: status.models.scoring_coding ?? status.models.scoring ?? status.models.text,
+      codingModelActive: Boolean(status.models.coding_model_active),
       scoring: status.models.scoring,
       mediaReasoning: status.models.media_reasoning,
     },
@@ -511,6 +523,8 @@ function toAIStatus(status: BackendAIStatus): AIStatus {
       topP: status.generation.top_p,
       maxOutputTokens: status.generation.max_output_tokens,
       requestTimeoutSeconds: status.generation.request_timeout_seconds,
+      codingTimeoutSeconds: status.generation.coding_timeout_seconds,
+      codingNumCtx: status.generation.coding_num_ctx,
     },
     media: status.media
       ? {
@@ -524,6 +538,8 @@ function toAIStatus(status: BackendAIStatus): AIStatus {
           ok: status.live.ok,
           message: status.live.message,
           availableModels: status.live.available_models,
+          codingModelReady: status.live.coding_model_ready,
+          codingModelWarning: status.live.coding_model_warning,
         }
       : undefined,
   };

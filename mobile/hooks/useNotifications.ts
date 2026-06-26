@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { Platform } from "react-native";
 import Constants from "expo-constants";
 import { useRouter } from "expo-router";
+import type * as ExpoNotifications from "expo-notifications";
 
 // expo-notifications logs a hard ERROR at module-init time when imported in
 // Expo Go (SDK 53+). A runtime guard on the import is not enough — the error
@@ -76,7 +77,7 @@ export function useNotifications() {
           type: Notifications.SchedulableTriggerInputTypes.DAILY,
           hour,
           minute: 0,
-        } satisfies Notifications.DailyTriggerInput,
+        } satisfies ExpoNotifications.DailyTriggerInput,
       });
     }
 
@@ -120,7 +121,7 @@ export function useNotifications() {
       const sessionId = data?.session_id as string | undefined;
 
       if (
-        (type === "voice_result" || type === "coding_result") &&
+        (type === "voice_result" || type === "coding_result" || type === "technical_result") &&
         typeof sessionId === "string" &&
         sessionId.length > 0
       ) {

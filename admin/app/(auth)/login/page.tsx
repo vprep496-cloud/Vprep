@@ -58,7 +58,15 @@ export default function LoginPage() {
   const router = useRouter();
   const { data: session, status } = useSession();
   const [demoLoading, setDemoLoading] = useState<string | null>(null);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [demoError, setDemoError] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  const authErrorMessage = authError
+    ? authError === "AccessDenied"
+      ? "Google sign-in could not be completed. Check that Firebase auth is configured and this Google account has an admin role."
+      : "Sign-in failed. Please try again or use a demo admin account."
+    : null;
 
   useEffect(() => {
     if (status !== "authenticated" || !session?.user) return;
@@ -68,6 +76,10 @@ export default function LoginPage() {
       router.replace("/");
     }
   }, [status, session, router]);
+
+  useEffect(() => {
+    setAuthError(new URLSearchParams(window.location.search).get("error"));
+  }, []);
 
   const handleDemoLogin = async (accountKey: string) => {
     setDemoError(null);
@@ -83,6 +95,14 @@ export default function LoginPage() {
       setDemoLoading(null);
     }
   };
+
+  const handleGoogleLogin = () => {
+    setDemoError(null);
+    setGoogleLoading(true);
+    signIn("google", { callbackUrl: "/" });
+  };
+
+  const displayError = demoError ?? authErrorMessage;
 
   return (
     <div className="flex min-h-screen bg-background">
@@ -138,12 +158,12 @@ export default function LoginPage() {
           {/* Google sign-in */}
           <button
             type="button"
-            onClick={() => signIn("google", { callbackUrl: "/" })}
-            disabled={status === "loading"}
+            onClick={handleGoogleLogin}
+            disabled={status === "loading" || googleLoading || demoLoading !== null}
             className="flex w-full items-center justify-center gap-3 rounded-xl border border-border bg-background-card px-6 py-3.5 text-sm font-semibold text-text-primary shadow-soft transition-all hover:shadow-lift hover:border-primary-200 disabled:opacity-50"
           >
-            <GoogleIcon />
-            Continue with Google
+            {googleLoading ? <Loader2 size={18} className="animate-spin text-primary-500" /> : <GoogleIcon />}
+            {googleLoading ? "Connecting to Google..." : "Continue with Google"}
           </button>
 
           {/* Divider */}
@@ -156,10 +176,10 @@ export default function LoginPage() {
           </div>
 
           {/* Error */}
-          {demoError && (
+          {displayError && (
             <div className="mb-4 flex items-center gap-2.5 rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
               <div className="h-2 w-2 shrink-0 rounded-full bg-danger" />
-              <p className="text-sm text-danger">{demoError}</p>
+              <p className="text-sm text-danger">{displayError}</p>
             </div>
           )}
 

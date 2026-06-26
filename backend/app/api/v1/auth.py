@@ -1,20 +1,24 @@
+import logging
 from datetime import datetime, timezone
 from typing import Any
 
 from bson import ObjectId
 from bson.errors import InvalidId
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorDatabase
 from pydantic import BaseModel
 from pymongo import ReturnDocument
 
+from app.core.config import get_settings
 from app.core.database import get_db
-from app.core.dependencies import bearer_scheme, get_current_user, require_role
+from app.core.dependencies import get_current_user, require_role
 from app.core.security import create_demo_token, verify_firebase_token
 from app.models.user import RoleUpdate, UserResponse
 
 router = APIRouter()
+logger = logging.getLogger("vprep.auth")
+sync_bearer_scheme = HTTPBearer(auto_error=False)
 
 # ---------------------------------------------------------------------------
 # Demo account registry — these users are created on-demand in MongoDB the
@@ -84,9 +88,36 @@ def _serialize_user(user: dict) -> dict:
     return serialized
 
 
+def _auth_detail(reason: str) -> str:
+    settings = get_settings()
+    return reason if settings.is_development else "Invalid authentication token."
+
+
+def _log_sync_authorization_header(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+) -> None:
+    settings = get_settings()
+    if not settings.is_development:
+        return
+
+    authorization = request.headers.get("authorization")
+    logger.info(
+        "[AuthDebug] /auth/sync Authorization header: %s",
+        {
+            "has_authorization_header": bool(authorization),
+            "starts_with_bearer": authorization.lower().startswith("bearer ")
+            if authorization
+            else False,
+            "token_length": len(credentials.credentials) if credentials else 0,
+        },
+    )
+
+
 @router.post("/sync", response_model=UserResponse)
 async def sync_user(
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(sync_bearer_scheme),
     db: AsyncIOMotorDatabase = Depends(get_db),
 ):
     """Verify the caller's Firebase token and upsert their user document.
@@ -94,6 +125,15 @@ async def sync_user(
     New users are created with role="candidate"; existing users have their
     profile fields refreshed from the latest Firebase claims.
     """
+    _log_sync_authorization_header(request, credentials)
+    if credentials is None:
+        authorization = request.headers.get("authorization")
+        reason = "malformed_bearer_token" if authorization else "missing_authorization_header"
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=_auth_detail(reason),
+        )
+
     decoded_token = verify_firebase_token(credentials.credentials)
 
     firebase_uid = decoded_token["uid"]

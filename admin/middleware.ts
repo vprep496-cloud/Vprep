@@ -13,7 +13,8 @@ export default auth((req) => {
     return NextResponse.redirect(new URL("/login", nextUrl));
   }
 
-  if (session.user?.role === "candidate") {
+  const role = session.user?.role;
+  if (role !== "admin" && role !== "superadmin") {
     return NextResponse.redirect(new URL("/unauthorized", nextUrl));
   }
 

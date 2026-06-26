@@ -58,6 +58,17 @@ const EVALUATING_MESSAGES = [
   "Building your personal plan...",
 ];
 
+function backendErrorMessage(error: unknown, fallback: string): string {
+  const detail = (error as { response?: { data?: { detail?: unknown } } } | undefined)
+    ?.response?.data?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) return detail.map((item) => String(item)).join(", ");
+  if ((error as { code?: string } | undefined)?.code === "ECONNABORTED") {
+    return "Scoring is taking longer than expected. Keep the app open and try again.";
+  }
+  return fallback;
+}
+
 function scoreBadgeMeta(score: number): { container: string; label: string } {
   if (score >= 8) return { container: "bg-success/15", label: "text-success" };
   if (score >= 5) return { container: "bg-warning/15", label: "text-warning" };
@@ -417,7 +428,7 @@ export default function AssessmentScreen() {
         Toast.show({
           type: "error",
           text1: "Something went wrong",
-          text2: "We couldn't score your assessment. Please try again.",
+          text2: backendErrorMessage(error, "We couldn't score your assessment. Please try again."),
         });
         setScreenState("answering");
       }
@@ -482,7 +493,11 @@ export default function AssessmentScreen() {
       return;
     }
 
-    submitAssessment(answers);
+    const finalAnswers = Object.fromEntries(
+      resolvedQuestions.map((question) => [question.id, (answers[question.id] ?? "").trim()])
+    );
+
+    submitAssessment(finalAnswers);
   }, [
     currentQuestion,
     meetsMinChars,

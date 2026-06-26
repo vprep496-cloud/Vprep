@@ -49,6 +49,7 @@ _QUESTION_COUNT_BY_PHASE = {"hr": 4, "technical": 4, "coding_logic": 1, "behavio
 # Intensity multipliers: "quick" ≈ half, "standard" = 1×, "deep" ≈ 1.5×.
 # Coding logic is always 1 regardless (limited by how many problems fit in a session).
 _INTENSITY_MULTIPLIERS = {"quick": 0.5, "standard": 1.0, "deep": 1.5}
+PROFESSIONAL_BANK_VERSION = "professional_v2"
 
 
 def _question_count_for_intensity(phase: str, intensity: str) -> int:
@@ -107,11 +108,11 @@ async def _sample_questions(
     count: int,
     preferred_difficulty: str | None = None,
 ) -> list[dict]:
-    """Randomly sample `count` questions for a phase via Mongo's `$sample`.
+    """Sample `count` active questions for a phase via Mongo's `$sample`.
 
-    HR and Behavioral can be track-agnostic (`track_id: "all"`) or tied to a
-    custom track. Technical/Coding Logic prefer the candidate's track but also
-    accept "all" fallback questions for reusable logic prompts.
+    The professional seed bank is preferred first, then admin/AI/custom-track
+    questions fill any shortage. Legacy seed rows without version/source/timestamp
+    metadata are skipped so old generic prompts do not crowd out better ones.
     """
     questions: list[dict] = []
 
@@ -122,15 +123,45 @@ async def _sample_questions(
         if extra_match:
             match.update(extra_match)
         if questions:
-            match["_id"] = {"$nin": [ObjectId(question["id"]) for question in questions]}
+            excluded_ids: list[ObjectId] = []
+            for question in questions:
+                try:
+                    excluded_ids.append(ObjectId(question["id"]))
+                except (InvalidId, TypeError, KeyError):
+                    continue
+            if excluded_ids:
+                match["_id"] = {"$nin": excluded_ids}
 
         pipeline = [{"$match": match}, {"$sample": {"size": remaining}}]
         async for document in db["questions"].aggregate(pipeline):
             questions.append(_serialize_question(document))
 
+    active_match = {"is_active": {"$ne": False}}
+    curated_match = {
+        "$or": [
+            {"bank_version": PROFESSIONAL_BANK_VERSION},
+            {"source": {"$in": ["ai_auto_fill", "local_auto_fill"]}},
+            {"created_at": {"$exists": True}},
+        ]
+    }
+    prioritized_matches: list[dict[str, Any]] = []
     if preferred_difficulty:
-        await run_sample({"difficulty": preferred_difficulty}, count)
-    await run_sample(None, count - len(questions))
+        prioritized_matches.append(
+            {
+                **active_match,
+                "bank_version": PROFESSIONAL_BANK_VERSION,
+                "difficulty": preferred_difficulty,
+            }
+        )
+    prioritized_matches.append({**active_match, "bank_version": PROFESSIONAL_BANK_VERSION})
+    if preferred_difficulty:
+        prioritized_matches.append({**active_match, **curated_match, "difficulty": preferred_difficulty})
+    prioritized_matches.append({**active_match, **curated_match})
+
+    for extra_match in prioritized_matches:
+        await run_sample(extra_match, count - len(questions))
+        if len(questions) >= count:
+            break
 
     return questions
 
@@ -244,40 +275,62 @@ def _fallback_question_documents(
         "behavioral": ["situation_context", "action_ownership", "result_impact", "reflection_learning"],
     }
 
+    focus_areas = candidate_profile.get("role_focus") or topics
+    focus_text = ", ".join(str(area) for area in focus_areas[:4])
+
     hr_questions = [
-        f"Walk me through your background and why you are preparing for a {target_role}.",
-        f"What makes you interested in {track_name}, and how does it connect to your recent learning, projects, or work?",
-        "Describe a strength you would bring to a team and a skill you are actively improving.",
-        "Tell me about a time you had to explain a complex idea clearly to someone else.",
+        f"Walk me through your background as if this were the first five minutes of an interview for a {target_role}. What should I remember?",
+        f"What attracted you to this {track_name} path, and what recent learning or project work shows you are preparing seriously?",
+        f"Which technical strength would you bring to a {target_role}, and which skill gap are you actively improving?",
+        "Describe how you would explain a complex technical decision to a stakeholder who needs a clear recommendation.",
+        "When joining a new team or project, how do you build context quickly without slowing other people down?",
+        "If an interviewer challenged a claim on your CV or portfolio, how would you respond professionally and support it with evidence?",
+        f"If you had 90 days in a {target_role}, what outcomes would you prioritize and how would you measure progress?",
+        "Tell me about a moment when your communication changed the outcome of a project, review, or team discussion.",
     ]
     behavioral_questions = [
-        "Tell me about a time you handled feedback on your work. What changed afterward?",
-        "Describe a situation where you had to collaborate under pressure. What did you do?",
-        "Tell me about a mistake or missed expectation and how you recovered from it.",
-        "Describe a time you took ownership of a problem without waiting to be asked.",
+        "Tell me about a time you received critical feedback on your work. What did you change afterward?",
+        "Describe a time you had to learn something unfamiliar quickly to complete a task or project.",
+        "Tell me about a deadline that became risky. How did you communicate, prioritize, and protect quality?",
+        "Describe a disagreement with a teammate about a technical or delivery decision. How did you handle it?",
+        "Tell me about a time you took ownership of a problem that was not clearly assigned to anyone.",
+        "Describe a situation where you had to make a tradeoff between speed, quality, and scope. What did you choose and why?",
+        "Tell me about a mistake that affected another person or team. How did you repair trust and prevent recurrence?",
+        "Give an example of how you handled ambiguity when requirements, data, or expectations were incomplete.",
+    ]
+    technical_templates = [
+        "Explain {topic} in the context of {track_name}. What tradeoffs, failure modes, or implementation details should a professional interviewer expect?",
+        "A {target_role} is asked to improve a feature involving {topic}. What questions would you ask first, and what solution approach would you propose?",
+        "How would you evaluate whether a {topic} solution is working well in production or real user conditions?",
+        "What are the most common mistakes candidates make when discussing {topic}, and how would you avoid them?",
+        "Design a practical troubleshooting plan for a {track_name} issue related to {topic}. What signals would you inspect first?",
+        "How would you explain {topic} to a junior teammate while still covering the important professional tradeoffs?",
+    ]
+    coding_logic_questions = [
+        f"Handwrite pseudocode for a {track_name} workflow that validates a list of records, removes duplicates in stable order, and reports invalid items. Include time/space complexity and edge cases.",
+        f"Handwrite an algorithm to rank {track_name} tasks by priority using a score, deadline, and status field. Include tie handling and complexity.",
+        f"Handwrite pseudocode for retrying failed {track_name} operations with backoff, a maximum retry count, and a final failure state.",
+        f"Handwrite logic to merge two ordered {track_name} result lists, remove duplicate IDs, and preserve the best available version of each item.",
     ]
 
     documents: list[dict] = []
     for index in range(count):
         topic = topics[index % len(topics)]
         if phase == "technical":
+            template = technical_templates[index % len(technical_templates)]
             question_text = (
-                f"Explain {topic} in the context of {track_name}. What tradeoffs, "
-                "failure modes, or practical implementation details should an interviewer expect?"
+                template.format(topic=topic, track_name=track_name, target_role=target_role)
+                + f" Focus areas to consider: {focus_text or track_name}."
             )
             model_answer = (
                 f"A strong {level} answer defines the concept accurately, explains why it matters, "
                 "gives a practical example, mentions tradeoffs or edge cases, and uses correct terminology."
             )
         elif phase == "coding_logic":
-            question_text = (
-            "On paper, handwrite an algorithm to process a list of inputs, detect duplicates, and return the "
-            "unique values in stable order. Capture a clear photo of your solution, including time/space "
-            "complexity and at least two edge cases."
-            )
+            question_text = coding_logic_questions[index % len(coding_logic_questions)]
             model_answer = (
-                "A strong solution uses a set for seen values, preserves insertion order in the output, "
-                "handles empty input and repeated values, and explains O(n) time with O(n) extra space."
+                "A strong solution decomposes the problem, chooses appropriate data structures, handles empty "
+                "input, duplicates, invalid values, and boundary conditions, and explains time/space complexity."
             )
         elif phase == "behavioral":
             question_text = behavioral_questions[index % len(behavioral_questions)]
@@ -301,7 +354,7 @@ def _fallback_question_documents(
                 "difficulty": difficulty,
                 "scoring_criteria": criteria_by_phase[phase],
                 "model_answer": model_answer,
-                "tags": ["auto_fill", "fallback", phase, level, track["id"]],
+                "tags": ["auto_fill", "fallback", phase, level, track["id"], PROFESSIONAL_BANK_VERSION],
             }
         )
     return documents
@@ -348,6 +401,7 @@ async def _auto_fill_missing_questions(
         {
             **document,
             "source": source,
+            "is_active": True,
             "skill_level": candidate_profile["skill_level"],
             "created_at": now,
             "updated_at": now,
@@ -659,6 +713,278 @@ async def score_text_answers_batch(questions: list[dict], answers_by_id: dict[st
     return scored
 
 
+async def submit_text_answer_batch_async(
+    session_id: str,
+    phase: str,
+    submitted_answers: list[Any],
+    db: AsyncIOMotorDatabase,
+) -> dict:
+    """Accept a technical text section immediately and score it in background.
+
+    The synchronous /answer-batch route waits for Ollama before returning. This
+    async path persists placeholders first so the candidate can continue using
+    the app while the technical batch is evaluated.
+    """
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found.")
+    if session["status"] != "in_progress":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Session already completed.")
+    if phase != "technical":
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Async batch scoring is for technical text answers.")
+
+    phase_questions = session.get("questions_by_phase", {}).get(phase, [])
+    questions_by_id = {question["id"]: question for question in phase_questions}
+    requested_ids = [str(getattr(answer, "question_id", "")) for answer in submitted_answers]
+
+    if len(set(requested_ids)) != len(requested_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Duplicate answers in batch.")
+    if not requested_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No answers submitted.")
+
+    existing_answer_ids = {answer["question_id"] for answer in session.get("answers", [])}
+    invalid_ids = [question_id for question_id in requested_ids if question_id not in questions_by_id]
+    already_answered = [question_id for question_id in requested_ids if question_id in existing_answer_ids]
+    non_text_ids = [
+        question_id
+        for question_id in requested_ids
+        if questions_by_id.get(question_id, {}).get("answer_type") != "text"
+    ]
+    answers_by_id = {
+        str(getattr(answer, "question_id", "")): str(getattr(answer, "text_answer", "")).strip()
+        for answer in submitted_answers
+    }
+    empty_ids = [question_id for question_id, text in answers_by_id.items() if len(text) < 20]
+
+    if invalid_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Question not found in this session.")
+    if already_answered:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="One or more answers were already submitted.")
+    if non_text_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Batch scoring only supports text answers.")
+    if empty_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Every technical answer must be at least 20 characters.")
+
+    placeholders: list[dict] = []
+    for question_id in requested_ids:
+        question = questions_by_id[question_id]
+        placeholders.append(
+            {
+                "question_id": question_id,
+                "question_text": question["question_text"],
+                "phase": phase,
+                "answer_type": "text",
+                "transcription": None,
+                "user_text_answer": answers_by_id[question_id],
+                "answer_duration_seconds": None,
+                "image_width": None,
+                "image_height": None,
+                "image_size_bytes": None,
+                "score": 0,
+                "criteria_scores": {},
+                "feedback": "Technical answer received — scoring in the background.",
+                "model_answer": question.get("model_answer", ""),
+                "confidence": None,
+                "strengths": [],
+                "improvements": [],
+                "review_flags": [],
+                "evidence": [],
+                "score_rationale": None,
+                "rubric_version": None,
+                "scoring_mode": "async_technical_text_batch",
+                "scoring_metadata": {},
+                "ai_score": None,
+                "ai_criteria_scores": None,
+                "ai_feedback": None,
+                "ai_confidence": None,
+                "ai_review_flags": [],
+                "ai_scoring_metadata": None,
+                "manual_review_status": "not_required",
+                "reviewer_notes": None,
+                "reviewed_by": None,
+                "reviewed_at": None,
+                "technical_score_status": "pending",
+            }
+        )
+
+    await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": {"$each": placeholders}}})
+    logger.info(
+        "Technical answer placeholders stored. session_id=%s count=%d",
+        session_id,
+        len(placeholders),
+    )
+
+    return {
+        "question_ids": requested_ids,
+        "status": "pending",
+        "message": "Your technical answers were saved. Scoring will continue in the background.",
+        "estimated_seconds": 90,
+    }
+
+
+async def _score_text_answer_batch_background(
+    session_id: str,
+    question_ids: list[str],
+    db: AsyncIOMotorDatabase,
+) -> None:
+    """Background task: score a saved technical text batch and patch answers."""
+    from app.services.notification_service import send_technical_result_notification
+
+    logger.info(
+        "Background technical score started. session_id=%s count=%d",
+        session_id,
+        len(question_ids),
+    )
+
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        logger.error("Background technical score: invalid session_id=%s", session_id)
+        return
+
+    for question_id in question_ids:
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question_id},
+            {"$set": {"answers.$.technical_score_status": "processing"}},
+        )
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        return
+
+    phase_questions = session.get("questions_by_phase", {}).get("technical", [])
+    questions_by_id = {question["id"]: question for question in phase_questions}
+    answers_by_id = {
+        answer["question_id"]: answer.get("user_text_answer", "")
+        for answer in session.get("answers", [])
+        if answer.get("question_id") in question_ids
+    }
+    questions = [questions_by_id[question_id] for question_id in question_ids if question_id in questions_by_id]
+
+    if len(questions) != len(question_ids) or any(not answers_by_id.get(qid) for qid in question_ids):
+        logger.error("Background technical score: missing question or answer data. session_id=%s", session_id)
+        for question_id in question_ids:
+            await db["sessions"].update_one(
+                {"_id": object_id, "answers.question_id": question_id},
+                {"$set": {
+                    "answers.$.technical_score_status": "failed",
+                    "answers.$.feedback": "Automatic scoring failed — saved answer data was incomplete.",
+                    "answers.$.manual_review_status": "pending",
+                }},
+            )
+        return
+
+    try:
+        scored_batch = await asyncio.wait_for(
+            score_text_answers_batch(questions, answers_by_id),
+            timeout=180,
+        )
+    except Exception as exc:
+        logger.warning("Background technical score failed. session_id=%s error=%s", session_id, exc)
+        for question_id in question_ids:
+            await db["sessions"].update_one(
+                {"_id": object_id, "answers.question_id": question_id},
+                {"$set": {
+                    "answers.$.technical_score_status": "failed",
+                    "answers.$.feedback": (
+                        "Automatic technical scoring is temporarily unavailable. "
+                        "Your answers were saved and can be reviewed later."
+                    ),
+                    "answers.$.review_flags": ["ai_scoring_unavailable", "manual_review_recommended"],
+                    "answers.$.ai_review_flags": ["ai_scoring_unavailable", "manual_review_recommended"],
+                    "answers.$.score_rationale": "Automatic technical scoring was unavailable.",
+                    "answers.$.manual_review_status": "pending",
+                }},
+            )
+        return
+
+    final_scores: list[int] = []
+    for question, scored in zip(questions, scored_batch):
+        review_flags = sorted(set(scored.get("review_flags", [])))
+        scoring_metadata = dict(scored.get("scoring_metadata") or {})
+        scoring_metadata["review_flags"] = review_flags
+        final_score = max(0, min(int(scored.get("overall_score", 0)), 100))
+        final_scores.append(final_score)
+
+        await db["sessions"].update_one(
+            {"_id": object_id, "answers.question_id": question["id"]},
+            {"$set": {
+                "answers.$.score": final_score,
+                "answers.$.criteria_scores": scored.get("criteria_scores", {}),
+                "answers.$.feedback": scored.get("feedback", ""),
+                "answers.$.model_answer": scored.get("model_answer") or question.get("model_answer", ""),
+                "answers.$.confidence": scored.get("confidence"),
+                "answers.$.strengths": scored.get("strengths", []),
+                "answers.$.improvements": scored.get("improvements", []),
+                "answers.$.review_flags": review_flags,
+                "answers.$.evidence": scored.get("evidence", []),
+                "answers.$.score_rationale": scored.get("score_rationale"),
+                "answers.$.rubric_version": scored.get("rubric_version"),
+                "answers.$.scoring_mode": scored.get("scoring_mode"),
+                "answers.$.scoring_metadata": scoring_metadata,
+                "answers.$.ai_score": final_score,
+                "answers.$.ai_criteria_scores": scored.get("criteria_scores", {}),
+                "answers.$.ai_feedback": scored.get("feedback", ""),
+                "answers.$.ai_confidence": scored.get("confidence"),
+                "answers.$.ai_review_flags": review_flags,
+                "answers.$.ai_scoring_metadata": scoring_metadata,
+                "answers.$.manual_review_status": "pending" if "manual_review_recommended" in review_flags else "not_required",
+                "answers.$.technical_score_status": "complete",
+            }},
+        )
+
+    average_score = round(sum(final_scores) / len(final_scores)) if final_scores else 0
+    logger.info(
+        "Background technical score complete. session_id=%s average=%d",
+        session_id,
+        average_score,
+    )
+    try:
+        await send_technical_result_notification(session["user_id"], average_score, session_id, db)
+    except Exception as notify_exc:
+        logger.warning("Technical result notification failed: %s", notify_exc)
+
+
+async def get_technical_score_status(
+    session_id: str,
+    user_id: str,
+    db: AsyncIOMotorDatabase,
+) -> list[dict]:
+    """Return async scoring status for every technical text answer."""
+    try:
+        object_id = ObjectId(session_id)
+    except (InvalidId, TypeError):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+
+    session = await db["sessions"].find_one({"_id": object_id})
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+    if session["user_id"] != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    results = []
+    for answer in session.get("answers", []):
+        if answer.get("phase") != "technical" or answer.get("answer_type") != "text":
+            continue
+        if answer.get("technical_score_status") is None:
+            continue
+        status_val = answer.get("technical_score_status", "complete")
+        results.append({
+            "question_id": answer["question_id"],
+            "status": status_val,
+            "score": answer.get("score") if status_val == "complete" else None,
+            "feedback": answer.get("feedback") if status_val == "complete" else None,
+            "criteria_scores": answer.get("criteria_scores", {}) if status_val == "complete" else {},
+            "estimated_seconds": 0 if status_val == "complete" else 90,
+        })
+    return results
+
+
 async def score_image_answer(question: dict, image_base64: str, image_mime_type: str | None = None) -> dict:
     """Use multimodal scoring to read and score a handwritten coding solution."""
     try:
@@ -708,7 +1034,24 @@ async def submit_coding_answer_async(
     if already_answered:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Answer already submitted for this question.")
 
-    # Persist a placeholder — scored=0 / status=pending so complete_session can proceed.
+    # Store the heavy image outside the session document. A single 5-8 MB image
+    # becomes a much larger base64 string, and embedding that inside the session
+    # can make completion/results writes hit MongoDB's 16 MB document limit.
+    await db["answer_payloads"].replace_one(
+        {"session_id": session_id, "question_id": question_id, "kind": "coding_image"},
+        {
+            "session_id": session_id,
+            "question_id": question_id,
+            "kind": "coding_image",
+            "image_base64": image_base64,
+            "image_mime_type": image_mime_type or "image/jpeg",
+            "created_at": datetime.now(timezone.utc),
+        },
+        upsert=True,
+    )
+
+    # Persist a lightweight placeholder — scored=0 / status=pending so
+    # complete_session can proceed once the upload itself has finished.
     review_flags: list[str] = []
     if image_width and image_height and max(image_width, image_height) < 700:
         review_flags.append("low_resolution_image")
@@ -751,9 +1094,6 @@ async def submit_coding_answer_async(
         "reviewed_at": None,
         # Async status tracking
         "coding_score_status": "pending",
-        # Store base64 for background processing (stripped after scoring)
-        "_coding_image_base64": image_base64,
-        "_coding_image_mime_type": image_mime_type or "image/jpeg",
     }
 
     await db["sessions"].update_one({"_id": object_id}, {"$push": {"answers": placeholder}})
@@ -812,17 +1152,27 @@ async def _score_coding_answer_background(
     if answer is None:
         return
 
-    image_base64 = answer.get("_coding_image_base64")
-    image_mime_type = answer.get("_coding_image_mime_type", "image/jpeg")
+    payload_doc = await db["answer_payloads"].find_one(
+        {"session_id": session_id, "question_id": question_id, "kind": "coding_image"}
+    )
+    image_base64 = (
+        (payload_doc or {}).get("image_base64")
+        or answer.get("_coding_image_base64")  # legacy sessions before payload split
+    )
+    image_mime_type = (
+        (payload_doc or {}).get("image_mime_type")
+        or answer.get("_coding_image_mime_type")
+        or "image/jpeg"
+    )
 
     if not image_base64:
         logger.error("Background coding: no image data stored. session_id=%s", session_id)
         await db["sessions"].update_one(
             {"_id": object_id, "answers.question_id": question_id},
             {"$set": {
-                "answers.$.coding_score_status": "failed",
-                "answers.$.feedback": "No image data was stored. Please re-submit your solution.",
-                "answers.$.manual_review_status": "pending",
+            "answers.$.coding_score_status": "failed",
+            "answers.$.feedback": "No image data was stored. Please re-submit your solution.",
+            "answers.$.manual_review_status": "pending",
             }},
         )
         return
@@ -927,6 +1277,9 @@ async def _score_coding_answer_background(
         await db["sessions"].update_one(
             {"_id": object_id, "answers.question_id": question_id},
             {"$set": update_fields},
+        )
+        await db["answer_payloads"].delete_one(
+            {"session_id": session_id, "question_id": question_id, "kind": "coding_image"}
         )
 
         logger.info(
@@ -1461,6 +1814,7 @@ def _recompute_phase_and_overall(
         has_pending = any(
             a.get("voice_score_status") in ("pending", "processing")
             or a.get("coding_score_status") in ("pending", "processing")
+            or a.get("technical_score_status") in ("pending", "processing")
             for a in answers
         )
         if not has_pending and answers:
@@ -1478,6 +1832,7 @@ def _recompute_phase_and_overall(
         not any(
             a.get("voice_score_status") in ("pending", "processing")
             or a.get("coding_score_status") in ("pending", "processing")
+            or a.get("technical_score_status") in ("pending", "processing")
             for a in ph.get("answers", [])
         )
         for ph in updated
@@ -1570,7 +1925,13 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
         if answer.get("answer_type") == "voice"
         and answer.get("voice_score_status") in ("pending", "processing")
     }
-    missing_ids = all_question_ids - answered_ids - coding_pending_ids - voice_pending_ids
+    technical_pending_ids = {
+        answer["question_id"]
+        for answer in answers
+        if answer.get("answer_type") == "text"
+        and answer.get("technical_score_status") in ("pending", "processing")
+    }
+    missing_ids = all_question_ids - answered_ids - coding_pending_ids - voice_pending_ids - technical_pending_ids
     if missing_ids:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1617,17 +1978,19 @@ async def complete_session(session_id: str, user_id: str, db: AsyncIOMotorDataba
         "overall_score": overall_score,
         "duration_seconds": duration_seconds,
     }
-    # Safety net: clear any remaining binary blobs atomically with the completion
-    # write.  Background voice/coding jobs clear their blobs as soon as they load
+    # Safety net: clear any remaining voice blob atomically with the completion
+    # write.  Background voice jobs clear their blobs as soon as they load
     # the data (before scoring begins), but this catches edge cases:
     #   • The background task hasn't been dispatched yet when the user finishes.
     #   • A background task errored before it could clear its blob.
+    # Coding images now live in answer_payloads, outside the session document,
+    # so completion must not clear legacy embedded coding blobs before a
+    # background scorer has a chance to read them.
     # Without this, embedding phase_results into a document that still holds
     # 4+ voice recordings (~4 MB each) would exceed MongoDB's 16 MB BSON limit
     # and produce an unhandled BSONDocumentTooLarge error → HTTP 500.
     blob_clear = {
         "answers.$[]._voice_audio_base64": None,
-        "answers.$[]._coding_image_base64": None,
     }
     await db["sessions"].update_one({"_id": object_id}, {"$set": {**updates, **blob_clear}})
 

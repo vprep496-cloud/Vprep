@@ -219,6 +219,7 @@ export interface AssessmentRoleSelection {
 // race and lose — bump AI-related endpoints to 90 s so the phone always
 // waits long enough to receive the personalized first question.
 const AI_TIMEOUT_MS = 90_000;
+const AI_SUBMIT_TIMEOUT_MS = 240_000;
 
 function roleBody(role?: AssessmentRoleSelection): Record<string, string> {
   if (!role) return {};
@@ -270,11 +271,15 @@ export async function submitAssessment(
   trackId: TrackId,
   answers: Record<string, string>
 ): Promise<SubmitAssessmentResult> {
-  const { data } = await api.post<BackendSubmitResponse>("/api/v1/assessment/submit", {
-    session_id: sessionId,
-    track_id: trackId,
-    answers,
-  });
+  const { data } = await api.post<BackendSubmitResponse>(
+    "/api/v1/assessment/submit",
+    {
+      session_id: sessionId,
+      track_id: trackId,
+      answers,
+    },
+    { timeout: AI_SUBMIT_TIMEOUT_MS }
+  );
   return { result: toResult(data.result), plan: toPlan(data.plan) };
 }
 

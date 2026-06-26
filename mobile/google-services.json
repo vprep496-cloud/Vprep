@@ -1,26 +1,40 @@
 {
   "project_info": {
-    "project_number": "1066252591394",
-    "project_id": "vprep-c7450",
-    "storage_bucket": "vprep-c7450.firebasestorage.app"
+    "project_number": "873343811059",
+    "project_id": "vprep-d4246",
+    "storage_bucket": "vprep-d4246.firebasestorage.app"
   },
   "client": [
     {
       "client_info": {
-        "mobilesdk_app_id": "1:1066252591394:android:5d418f4329c158481bc57b",
+        "mobilesdk_app_id": "1:873343811059:android:5d418f4329c158481bc57b",
         "android_client_info": {
           "package_name": "com.vprep.app"
         }
       },
-      "oauth_client": [],
+      "oauth_client": [
+        {
+          "client_type": 3,
+          "client_id": "873343811059-sonmgd9h0qojmg2mnpdlccqo9pp8ork5.apps.googleusercontent.com",
+          "android_info": {
+            "package_name": "com.vprep.app",
+            "certificate_hash": []
+          }
+        }
+      ],
       "api_key": [
         {
-          "current_key": "AIzaSyCC4JcJsf2t5_HP_4GbKDQUg9vvrjN4Irs"
+          "current_key": "AIzaSyA1fXArD3DQt_pDggAlyp9KYx4nlf1nf_g"
         }
       ],
       "services": {
         "appinvite_service": {
-          "other_platform_oauth_client": []
+          "other_platform_oauth_client": [
+            {
+              "client_type": 3,
+              "client_id": "873343811059-9boh5f1ao9d0bcbns1n9fq659jfms926.apps.googleusercontent.com"
+            }
+          ]
         }
       }
     }

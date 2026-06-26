@@ -53,6 +53,27 @@ function csvToList(value: string): string[] {
     .filter(Boolean);
 }
 
+function questionPlaceholder(phase: InterviewPhase | "") {
+  if (phase === "coding_logic") {
+    return "Handwrite pseudocode for a production-style task, such as retrying failed API writes with backoff, preserving order, and preventing duplicate submissions. Include input/output, one example, complexity, and edge cases.";
+  }
+  return "e.g. Tell me about a time you disagreed with a teammate's technical decision.";
+}
+
+function criteriaPlaceholder(phase: InterviewPhase | "") {
+  if (phase === "coding_logic") {
+    return "problem_decomposition\nalgorithm_correctness\nedge_cases\ncomplexity_awareness\nclarity";
+  }
+  return "Clarity of communication\nUse of a concrete example\nReflection / lesson learned";
+}
+
+function modelAnswerPlaceholder(phase: InterviewPhase | "") {
+  if (phase === "coding_logic") {
+    return "Approach: describe the intended algorithm and data structures.\nCode: concise pseudocode or Python-like solution.\nComplexity: Time: O(...) | Space: O(...)\nEdge cases: list the important boundary cases.";
+  }
+  return "Describe the ideal answer or rubric points the AI should score against.";
+}
+
 // Phase 6 — superadmin-only "Add Question" form (Agent Rule #7: this modal is
 // only ever mounted from `questions/page.tsx` behind a
 // `session.user.role === "superadmin"` check — not rendered-but-disabled for
@@ -215,7 +236,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
                 value={form.questionText}
                 onChange={(event) => update("questionText", event.target.value)}
                 rows={2}
-                placeholder="e.g. Tell me about a time you disagreed with a teammate's technical decision."
+                placeholder={questionPlaceholder(form.phase)}
                 className={`${FIELD_CLASS} resize-none`}
               />
             </label>
@@ -244,7 +265,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
                 value={form.scoringCriteria}
                 onChange={(event) => update("scoringCriteria", event.target.value)}
                 rows={3}
-                placeholder={"Clarity of communication\nUse of a concrete example\nReflection / lesson learned"}
+                placeholder={criteriaPlaceholder(form.phase)}
                 className={`${FIELD_CLASS} resize-none font-mono`}
               />
             </label>
@@ -256,6 +277,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
                 value={form.modelAnswer}
                 onChange={(event) => update("modelAnswer", event.target.value)}
                 rows={3}
+                placeholder={modelAnswerPlaceholder(form.phase)}
                 className={`${FIELD_CLASS} resize-none`}
               />
             </label>
@@ -266,7 +288,7 @@ export default function AddQuestionModal({ isOpen, onClose, onSuccess, trackOpti
                 type="text"
                 value={form.tags}
                 onChange={(event) => update("tags", event.target.value)}
-                placeholder="communication, conflict-resolution"
+                placeholder={form.phase === "coding_logic" ? "retry, queue, complexity, handwritten" : "communication, conflict-resolution"}
                 className={FIELD_CLASS}
               />
             </label>

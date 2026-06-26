@@ -31,6 +31,9 @@ function SettingRow({ label, value }: { label: string; value: string | number | 
 }
 
 function ModelsPanel({ status }: { status: AIStatus }) {
+  const codingReady = status.live?.codingModelReady;
+  const codingUsesSpecializedModel = status.models.codingModelActive;
+
   return (
     <div className="rounded-2xl border border-border-soft bg-background-card p-5 shadow-soft">
       <div className="flex items-center gap-2.5">
@@ -40,11 +43,25 @@ function ModelsPanel({ status }: { status: AIStatus }) {
         <h2 className="text-base font-bold text-text-primary">Model Routing</h2>
       </div>
       <div className="mt-3">
+        <SettingRow label="Default model" value={status.models.default} />
         <SettingRow label="Text model" value={status.models.text} />
         <SettingRow label="JSON model" value={status.models.json} />
-        <SettingRow label="Scoring model" value={status.models.scoring} />
-        <SettingRow label="Media reasoning model" value={status.models.mediaReasoning} />
+        <SettingRow label="Voice / HR scoring" value={status.models.scoringVoiceHr} />
+        <SettingRow label="Coding scoring" value={status.models.scoringCoding} />
+        <SettingRow
+          label="Coding route"
+          value={codingUsesSpecializedModel ? "Code-specialized model" : "General scoring fallback"}
+        />
+        <SettingRow label="Coding context window" value={status.generation.codingNumCtx ?? null} />
+        <SettingRow label="Coding timeout" value={status.generation.codingTimeoutSeconds ?? null} />
       </div>
+
+      {codingReady === false || status.live?.codingModelWarning ? (
+        <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">
+          {status.live?.codingModelWarning ??
+            `Coding scoring is configured for ${status.models.scoringCoding}, but the live check did not confirm it is available.`}
+        </div>
+      ) : null}
     </div>
   );
 }

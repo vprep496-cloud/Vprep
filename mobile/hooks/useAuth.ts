@@ -12,11 +12,18 @@ import {
 import { firebaseAuth } from "../lib/firebase";
 import { useAuthStore } from "../stores/auth.store";
 import { syncUser } from "../services/auth.service";
-import api from "../services/api";
+import api, { TOKEN_STORAGE_KEY } from "../services/api";
 import { useAppStore } from "../stores/app.store";
 import { getEnrollments } from "../services/enrollment.service";
 import { unregisterPushToken } from "../services/notification.service";
 import { API_BASE_URL } from "../config/runtime";
+import { getItem as getStoredItem } from "../lib/storage";
+import {
+  MOBILE_ROLE_BLOCK_MESSAGE,
+  ensureMobileCandidate,
+  isMobileRoleAccessError,
+} from "../lib/mobileAuthAccess";
+import type { User } from "../types";
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -62,7 +69,7 @@ function getGoogleClientConfig() {
     return {
       clientId: webClientId,
       envName: "EXPO_PUBLIC_GOOGLE_WEB_CLIENT_ID",
-      label: "Expo Go Web",
+      label: "Expo Go",
     };
   }
 
@@ -89,20 +96,162 @@ function getGoogleClientConfig() {
   };
 }
 
-function getIdTokenFromUrl(url: string): string | undefined {
-  const queryStart = url.indexOf("?");
-  const hashStart = url.indexOf("#");
-  let params = "";
+type AuthResponsePayload = {
+  token?: string;
+  accessToken?: string;
+  access_token?: string;
+  idToken?: string;
+  id_token?: string;
+  user?: User;
+};
 
-  if (queryStart !== -1) {
-    params += url.slice(queryStart + 1, hashStart !== -1 ? hashStart : url.length);
-  }
-  if (hashStart !== -1) {
-    if (params) params += "&";
-    params += url.slice(hashStart + 1);
+type GoogleAuthResult = AuthSession.AuthSessionResult;
+type CompletedGoogleAuthResult = Extract<
+  GoogleAuthResult,
+  { params: Record<string, string> }
+>;
+type SuccessfulGoogleAuthResult = CompletedGoogleAuthResult & { type: "success" };
+
+type GoogleTokens = {
+  idToken?: string;
+  accessToken?: string;
+  code?: string;
+};
+
+function normalizeAuthResponse(data: AuthResponsePayload) {
+  const token =
+    data?.token ??
+    data?.accessToken ??
+    data?.access_token ??
+    data?.idToken ??
+    data?.id_token;
+
+  return {
+    token,
+    user: data?.user,
+  };
+}
+
+function logAuthDebug(message: string, details?: Record<string, unknown>) {
+  if (!__DEV__) return;
+  console.log(message, details ?? {});
+}
+
+function getBackendErrorMessage(error: unknown, fallback: string) {
+  if (!axios.isAxiosError(error)) {
+    return error instanceof Error ? error.message : fallback;
   }
 
-  return new URLSearchParams(params).get("id_token") ?? undefined;
+  const detail = error.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail) && detail.length > 0) return "Please check your login details.";
+  return error.message || fallback;
+}
+
+function isAuthRejected(error: unknown) {
+  return (
+    axios.isAxiosError(error) &&
+    (error.response?.status === 401 || error.response?.status === 403)
+  );
+}
+
+function isSuccessfulAuthResult(
+  result: GoogleAuthResult
+): result is SuccessfulGoogleAuthResult {
+  return result.type === "success";
+}
+
+function isCompletedAuthResult(result: GoogleAuthResult): result is CompletedGoogleAuthResult {
+  return result.type === "success" || result.type === "error";
+}
+
+function extractGoogleTokens(result: GoogleAuthResult): GoogleTokens {
+  if (!isSuccessfulAuthResult(result)) return {};
+
+  const params = result.params ?? {};
+  return {
+    idToken: params.id_token ?? params.idToken ?? result.authentication?.idToken,
+    accessToken:
+      params.access_token ?? params.accessToken ?? result.authentication?.accessToken,
+    code: params.code,
+  };
+}
+
+function logGoogleAuthResult(label: string, result: GoogleAuthResult) {
+  const tokens = extractGoogleTokens(result);
+  const params = isCompletedAuthResult(result) ? result.params : {};
+
+  logAuthDebug(label, {
+    responseType: result.type,
+    paramsKeys: Object.keys(params ?? {}),
+    hasIdToken: Boolean(tokens.idToken),
+    hasAccessToken: Boolean(tokens.accessToken),
+    hasCode: Boolean(tokens.code),
+    hasAuthentication: isSuccessfulAuthResult(result)
+      ? Boolean(result.authentication)
+      : false,
+    hasAuthenticationIdToken: isSuccessfulAuthResult(result)
+      ? Boolean(result.authentication?.idToken)
+      : false,
+    hasAuthenticationAccessToken: isSuccessfulAuthResult(result)
+      ? Boolean(result.authentication?.accessToken)
+      : false,
+  });
+}
+
+function getGoogleResultError(result: GoogleAuthResult) {
+  if (result.type !== "error") return null;
+
+  const description = result.params?.error_description;
+  if (description) return description;
+
+  const errorMessage = result.error?.message;
+  if (errorMessage) return errorMessage;
+
+  return "Google sign-in failed. Please try again.";
+}
+
+function getFirebaseAuthCode(error: unknown) {
+  if (
+    error instanceof Error &&
+    "code" in error &&
+    typeof (error as { code?: unknown }).code === "string"
+  ) {
+    return (error as { code: string }).code;
+  }
+
+  return undefined;
+}
+
+function getGoogleSignInFailureMessage(error: unknown) {
+  if (isMobileRoleAccessError(error)) {
+    return MOBILE_ROLE_BLOCK_MESSAGE;
+  }
+
+  if (axios.isAxiosError(error)) {
+    if (error.code === "ERR_NETWORK" || !error.response) {
+      return `Google sign-in finished, but the backend is unreachable at ${API_BASE_URL}. Update EXPO_PUBLIC_API_URL to this laptop's LAN IP and make sure backend port 8000 is running.`;
+    }
+
+    if (error.response.status === 401 || error.response.status === 403) {
+      return "Google sign-in finished, but the backend rejected the Firebase token. Make sure backend/firebase-service-account.json and the mobile Firebase env values are from the same Firebase project.";
+    }
+
+    return getBackendErrorMessage(error, "Google sign-in failed. Please try again.");
+  }
+
+  const firebaseCode = getFirebaseAuthCode(error);
+  if (firebaseCode === "auth/operation-not-allowed") {
+    return "Google sign-in is not enabled in Firebase Authentication for this project.";
+  }
+  if (firebaseCode === "auth/account-exists-with-different-credential") {
+    return "This email is already registered with a different sign-in method.";
+  }
+  if (firebaseCode === "auth/invalid-credential") {
+    return "Google returned a credential Firebase could not use. Check that the app's Google OAuth client IDs belong to the same Firebase project.";
+  }
+
+  return error instanceof Error ? error.message : "Something went wrong while signing in.";
 }
 
 export function useAuth() {
@@ -112,9 +261,11 @@ export function useAuth() {
   const setUser = useAuthStore((s) => s.setUser);
   const setToken = useAuthStore((s) => s.setToken);
   const logout = useAuthStore((s) => s.logout);
+  const setOAuthProcessing = useAuthStore((s) => s.setOAuthProcessing);
+  const setAccessMessage = useAuthStore((s) => s.setAccessMessage);
   const setEnrollments = useAppStore((s) => s.setEnrollments);
 
-  const nonceRef = useRef(Math.random().toString(36).substring(2));
+  const nonceRef = useRef(Math.random().toString(36).slice(2));
   const googleClient = useMemo(() => getGoogleClientConfig(), []);
   const expoAuthProxyRedirectUri = useMemo(() => getExpoAuthProxyRedirectUri(), []);
   const appReturnUri = useMemo(
@@ -126,7 +277,14 @@ export function useAuth() {
       }),
     []
   );
-  const authorizationRedirectUri = isExpoGo ? expoAuthProxyRedirectUri : appReturnUri;
+
+  const isWebAuth = Platform.OS === "web";
+  const usesImplicitIdTokenFlow = isExpoGo || isWebAuth;
+  const authorizationRedirectUri = usesImplicitIdTokenFlow
+    ? isExpoGo
+      ? expoAuthProxyRedirectUri
+      : appReturnUri
+    : appReturnUri;
 
   const googleConfigError = useMemo(() => {
     if (!isExpoGo && authorizationRedirectUri.startsWith("exp://")) {
@@ -138,18 +296,27 @@ export function useAuth() {
     }
 
     return null;
-  }, [googleClient, authorizationRedirectUri]);
+  }, [authorizationRedirectUri, googleClient]);
 
   useEffect(() => {
-    if (!__DEV__) return;
-    console.log("[useAuth] Google OAuth redirect URI:", authorizationRedirectUri);
-    console.log("[useAuth] Google OAuth app return URI:", appReturnUri);
-    console.log("[useAuth] Google OAuth client env:", googleClient.envName);
-    console.log("[useAuth] API base URL:", API_BASE_URL);
-  }, [appReturnUri, authorizationRedirectUri, googleClient.envName]);
-
-  const isWebAuth = Platform.OS === "web";
-  const usesImplicitIdTokenFlow = isExpoGo || isWebAuth;
+    logAuthDebug("[useAuth] Google OAuth config", {
+      runtime: isExpoGo ? "expo-go" : Platform.OS,
+      redirectUri: authorizationRedirectUri,
+      appReturnUri,
+      proxyRedirectUri: expoAuthProxyRedirectUri,
+      clientEnv: googleClient.envName,
+      responseType: usesImplicitIdTokenFlow
+        ? AuthSession.ResponseType.IdToken
+        : AuthSession.ResponseType.Code,
+      apiBaseUrl: API_BASE_URL,
+    });
+  }, [
+    appReturnUri,
+    authorizationRedirectUri,
+    expoAuthProxyRedirectUri,
+    googleClient.envName,
+    usesImplicitIdTokenFlow,
+  ]);
 
   const [request, , promptAsync] = AuthSession.useAuthRequest(
     {
@@ -170,132 +337,276 @@ export function useAuth() {
     googleDiscovery
   );
 
+  const resetAuthenticatedState = async () => {
+    await setToken(null);
+    setUser(null);
+    setEnrollments([]);
+    setAccessMessage(null);
+    try {
+      await firebaseSignOut(firebaseAuth);
+    } catch {
+      // Local state is already cleared; Firebase cleanup can retry later.
+    }
+  };
+
+  const exchangeGoogleCode = async (code: string) => {
+    if (!googleClient.clientId) {
+      throw new Error(`Missing ${googleClient.envName}.`);
+    }
+
+    if (!request?.codeVerifier) {
+      throw new Error(
+        "Google returned an authorization code, but the app has no PKCE verifier to exchange it."
+      );
+    }
+
+    const tokenResponse = await AuthSession.exchangeCodeAsync(
+      {
+        clientId: googleClient.clientId,
+        code,
+        redirectUri: authorizationRedirectUri,
+        scopes: GOOGLE_SCOPES,
+        extraParams: {
+          code_verifier: request.codeVerifier,
+        },
+      },
+      googleDiscovery
+    );
+
+    return {
+      idToken: tokenResponse.idToken,
+      accessToken: tokenResponse.accessToken,
+    };
+  };
+
+  const resolveGoogleTokens = async (authResult: GoogleAuthResult) => {
+    const tokens = extractGoogleTokens(authResult);
+
+    if ((!tokens.idToken || !tokens.accessToken) && tokens.code) {
+      logAuthDebug("[GoogleAuth] exchanging authorization code", {
+        hasCodeVerifier: Boolean(request?.codeVerifier),
+        redirectUri: authorizationRedirectUri,
+      });
+
+      const exchangedTokens = await exchangeGoogleCode(tokens.code);
+      tokens.idToken = tokens.idToken ?? exchangedTokens.idToken;
+      tokens.accessToken = tokens.accessToken ?? exchangedTokens.accessToken;
+    }
+
+    if (!tokens.idToken && !tokens.accessToken) {
+      throw new Error("Google did not return a usable authentication token.");
+    }
+
+    return tokens;
+  };
+
+  const signIntoFirebaseAndBackend = async (tokens: GoogleTokens) => {
+    logAuthDebug("[GoogleAuth] creating Firebase credential", {
+      hasIdToken: Boolean(tokens.idToken),
+      hasAccessToken: Boolean(tokens.accessToken),
+    });
+
+    const credential = GoogleAuthProvider.credential(
+      tokens.idToken ?? null,
+      tokens.accessToken ?? null
+    );
+
+    logAuthDebug("[FirebaseAuth] signInWithCredential started");
+    const userCredential = await signInWithCredential(firebaseAuth, credential);
+    const firebaseIdToken = await userCredential.user.getIdToken(true);
+
+    logAuthDebug("[FirebaseAuth] signInWithCredential success", {
+      firebaseUid: userCredential.user.uid,
+      hasFirebaseIdToken: Boolean(firebaseIdToken),
+      firebaseIdTokenLength: firebaseIdToken.length,
+      firebaseIdTokenLooksLikeJwt: firebaseIdToken.split(".").length === 3,
+    });
+
+    const backendUser = ensureMobileCandidate(await syncUser(firebaseIdToken));
+    await setToken(firebaseIdToken);
+    api.defaults.headers.common.Authorization = `Bearer ${firebaseIdToken}`;
+
+    const storedToken = await getStoredItem(TOKEN_STORAGE_KEY);
+    logAuthDebug("[Storage] Firebase token persisted", {
+      key: TOKEN_STORAGE_KEY,
+      saved: Boolean(storedToken),
+    });
+
+    try {
+      const enrollments = await getEnrollments();
+      setEnrollments(enrollments);
+    } catch (enrollmentError) {
+      if (isAuthRejected(enrollmentError)) {
+        throw enrollmentError;
+      }
+      logAuthDebug("[useAuth] failed to load enrollments after Google login", {
+        message: getBackendErrorMessage(enrollmentError, "Enrollment load failed."),
+      });
+    }
+
+    setUser(backendUser);
+    logAuthDebug("[useAuth] Google authentication complete", {
+      endpoint: `${API_BASE_URL}/api/v1/auth/sync`,
+      userId: backendUser.id,
+      role: backendUser.role,
+    });
+  };
+
+  const promptWithExpoGoProxy = async () => {
+    if (!request?.url) {
+      throw new Error("Google sign-in is still initializing. Please try again in a moment.");
+    }
+
+    const proxyStartUrl =
+      `${expoAuthProxyRedirectUri}/start?` +
+      new URLSearchParams({
+        authUrl: request.url,
+        returnUrl: appReturnUri,
+      }).toString();
+
+    const browserResult = await WebBrowser.openAuthSessionAsync(proxyStartUrl, appReturnUri);
+    logAuthDebug("[GoogleAuth] Expo Go browser result", {
+      type: browserResult.type,
+      hasUrl: "url" in browserResult && Boolean(browserResult.url),
+    });
+
+    if (browserResult.type !== "success" || !("url" in browserResult)) {
+      return { type: browserResult.type } as GoogleAuthResult;
+    }
+
+    return request.parseReturnUrl(browserResult.url);
+  };
+
   const signInWithGoogle = async () => {
+    if (isSigningIn) return;
+
     setError(null);
+    setAccessMessage(null);
     setIsSigningIn(true);
+    setOAuthProcessing(true);
+
     try {
       if (googleConfigError) {
+        setError(googleConfigError);
         return;
       }
 
       if (!request || !request.url || !googleClient.clientId) {
+        setError("Google sign-in is still initializing. Please try again in a moment.");
         return;
       }
 
-      let idToken: string | undefined;
+      logAuthDebug("[GoogleAuth] prompt started", {
+        runtime: isExpoGo ? "expo-go" : Platform.OS,
+        redirectUri: authorizationRedirectUri,
+        returnUri: appReturnUri,
+      });
 
-      if (isExpoGo) {
-        const proxyStartUrl =
-          `${expoAuthProxyRedirectUri}/start?` +
-          new URLSearchParams({
-            authUrl: request.url ?? "",
-            returnUrl: appReturnUri,
-          }).toString();
+      const authResult = isExpoGo ? await promptWithExpoGoProxy() : await promptAsync();
+      logGoogleAuthResult("[GoogleAuth] OAuth result", authResult);
 
-        const browserResult = await WebBrowser.openAuthSessionAsync(proxyStartUrl, appReturnUri);
-        if (browserResult.type !== "success") {
-          return;
-        }
-
-        idToken = getIdTokenFromUrl(browserResult.url);
-      } else {
-        const result = await promptAsync();
-        if (result.type !== "success") {
-          if (result.type === "error") {
-            setError(
-              result.params?.error_description ??
-                result.error?.message ??
-                "Google sign-in failed. Please try again."
-            );
-          }
-          return;
-        }
-
-        idToken = result.params?.id_token;
-        const authCode = result.params?.code;
-
-        if (!idToken && authCode) {
-          const tokenResponse = await AuthSession.exchangeCodeAsync(
-            {
-              clientId: googleClient.clientId,
-              code: authCode,
-              redirectUri: authorizationRedirectUri,
-              scopes: GOOGLE_SCOPES,
-              extraParams: {
-                code_verifier: request.codeVerifier ?? "",
-              },
-            },
-            googleDiscovery
-          );
-          idToken = tokenResponse.idToken;
-        }
-      }
-
-      if (!idToken) {
-        setError("Google did not return an ID token. Please try again.");
+      if (!isSuccessfulAuthResult(authResult)) {
+        const message = getGoogleResultError(authResult);
+        if (message) setError(message);
         return;
       }
 
-      // Exchange the Google ID token for a Firebase credential/session.
-      const credential = GoogleAuthProvider.credential(idToken);
-      const userCredential = await signInWithCredential(firebaseAuth, credential);
-      const firebaseIdToken = await userCredential.user.getIdToken(true);
-      await setToken(firebaseIdToken);
+      const tokens = await resolveGoogleTokens(authResult);
+      logAuthDebug("[GoogleAuth] token availability before Firebase", {
+        hasIdToken: Boolean(tokens.idToken),
+        hasAccessToken: Boolean(tokens.accessToken),
+      });
 
-      const backendUser = await syncUser();
-      setUser(backendUser);
-
+      await signIntoFirebaseAndBackend(tokens);
     } catch (err) {
-      await setToken(null);
-      try {
-        await firebaseSignOut(firebaseAuth);
-      } catch {
-        // Ignore cleanup failures; the original auth error is more useful.
-      }
+      await resetAuthenticatedState();
 
-      if (axios.isAxiosError(err)) {
-        if (err.code === "ERR_NETWORK" || !err.response) {
-          setError(
-            `Google sign-in finished, but the backend is unreachable at ${API_BASE_URL}. Update EXPO_PUBLIC_API_URL to this laptop's LAN IP and make sure backend port 8000 is running.`
-          );
-          return;
-        }
-
-        if (err.response.status === 401 || err.response.status === 403) {
-          setError(
-            "Google sign-in finished, but the backend rejected the Firebase token. Make sure backend/firebase-service-account.json and the mobile Firebase env values are from the same Firebase project."
-          );
-          return;
+      if (__DEV__) {
+        if (axios.isAxiosError(err)) {
+          console.warn("[useAuth] Google login/sync failed", {
+            endpoint: `${API_BASE_URL}/api/v1/auth/sync`,
+            status: err.response?.status,
+            detail: err.response?.data?.detail,
+            code: err.code,
+            message: err.message,
+          });
+        } else {
+          const firebaseCode = getFirebaseAuthCode(err);
+          console.warn("[useAuth] Google login failed", {
+            code: firebaseCode,
+            message: err instanceof Error ? err.message : String(err),
+          });
         }
       }
 
-      const message = err instanceof Error ? err.message : "Something went wrong while signing in.";
-      setError(message);
+      setError(getGoogleSignInFailureMessage(err));
     } finally {
+      setOAuthProcessing(false);
       setIsSigningIn(false);
     }
   };
 
-  // ── Demo login — bypasses Firebase entirely ─────────────────────────────────
   const signInWithDemo = async (accountKey: string) => {
     setError(null);
+    setAccessMessage(null);
     setIsSigningIn(true);
     try {
-      const response = await api.post("/api/v1/auth/demo-login", {
+      logAuthDebug("[useAuth] demo login request", {
+        endpoint: `${API_BASE_URL}/api/v1/auth/demo-login`,
+        accountKey,
+      });
+
+      const response = await api.post<AuthResponsePayload>("/api/v1/auth/demo-login", {
         account_key: accountKey,
       });
-      const { token, user } = response.data;
+
+      const { token, user } = normalizeAuthResponse(response.data);
+      logAuthDebug("[useAuth] demo login response", {
+        endpoint: `${API_BASE_URL}/api/v1/auth/demo-login`,
+        status: response.status,
+        responseKeys: Object.keys(response.data ?? {}),
+        hasToken: Boolean(token),
+        hasUser: Boolean(user),
+      });
+
+      if (!token || !user) {
+        throw new Error("Login response did not include a token and user.");
+      }
+
+      const candidateUser = ensureMobileCandidate(user);
+
       await setToken(token);
-      setUser(user);
+      api.defaults.headers.common.Authorization = `Bearer ${token}`;
+
       try {
         const enrollments = await getEnrollments();
         setEnrollments(enrollments);
-      } catch {
-        // Non-fatal — home screen shows empty state gracefully.
+      } catch (enrollmentError) {
+        if (isAuthRejected(enrollmentError)) {
+          throw enrollmentError;
+        }
+        logAuthDebug("[useAuth] failed to load enrollments after demo login", {
+          message: getBackendErrorMessage(enrollmentError, "Enrollment load failed."),
+        });
       }
+      setUser(candidateUser);
     } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Demo login failed. Is the backend running?";
+      await setToken(null);
+      setUser(null);
+      setEnrollments([]);
+
+      if (__DEV__ && axios.isAxiosError(err)) {
+        console.warn("[useAuth] demo login failed", {
+          endpoint: `${API_BASE_URL}/api/v1/auth/demo-login`,
+          status: err.response?.status,
+          detail: err.response?.data?.detail,
+          code: err.code,
+        });
+      }
+
+      const message = isMobileRoleAccessError(err)
+        ? MOBILE_ROLE_BLOCK_MESSAGE
+        : getBackendErrorMessage(err, "Demo login failed. Is the backend running?");
       setError(message);
     } finally {
       setIsSigningIn(false);
@@ -308,8 +619,6 @@ export function useAuth() {
     } catch {
       // ignore
     }
-    // Clear local session BEFORE Firebase sign-out to prevent race condition
-    // where onAuthStateChanged fires with a still-valid stored token.
     await logout();
     try {
       await firebaseSignOut(firebaseAuth);

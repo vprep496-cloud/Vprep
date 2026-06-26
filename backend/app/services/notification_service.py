@@ -189,6 +189,33 @@ async def send_voice_result_notification(
     )
 
 
+async def send_technical_result_notification(
+    user_id: str, score: int, session_id: str, db: AsyncIOMotorDatabase
+) -> None:
+    """Notify the user that their async technical section score is ready."""
+    token = await _get_user_push_token(user_id, db)
+    if not token:
+        return
+
+    if score >= 80:
+        emoji = "🎉"
+        sub = f"Strong technical round — average score {score}/100!"
+    elif score >= 60:
+        emoji = "✅"
+        sub = f"Your technical answers are scored: {score}/100."
+    else:
+        emoji = "📝"
+        sub = f"Technical scoring is complete: {score}/100. Review the feedback and keep practising."
+
+    await send_push(
+        [token],
+        title=f"{emoji} Technical Score Ready",
+        body=sub,
+        data={"type": "technical_result", "score": score, "session_id": session_id},
+        channel_id="results",
+    )
+
+
 async def send_daily_reminder(user_id: str, streak_days: int, db: AsyncIOMotorDatabase) -> None:
     """Daily practice reminder — called by a scheduled job."""
     token = await _get_user_push_token(user_id, db)

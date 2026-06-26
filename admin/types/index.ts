@@ -285,10 +285,14 @@ export interface AIStatus {
   sdk: string;
   endpoint?: string | null;
   models: {
+    default: string;
     text: string;
     json: string;
-    scoring: string;
-    mediaReasoning: string;
+    scoringVoiceHr: string;
+    scoringCoding: string;
+    codingModelActive: boolean;
+    scoring?: string;
+    mediaReasoning?: string;
   };
   generation: {
     temperature: number;
@@ -296,6 +300,8 @@ export interface AIStatus {
     topP: number;
     maxOutputTokens: number;
     requestTimeoutSeconds?: number;
+    codingTimeoutSeconds?: number;
+    codingNumCtx?: number;
   };
   media?: {
     imageOcr?: string;
@@ -306,5 +312,7 @@ export interface AIStatus {
     ok: boolean;
     message: string;
     availableModels?: string[];
+    codingModelReady?: boolean;
+    codingModelWarning?: string;
   };
 }

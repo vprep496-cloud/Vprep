@@ -29,6 +29,7 @@ import {
 } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
+import CodingAnalysisPanel from "@/components/ui/CodingAnalysisPanel";
 import type {
   InterviewPhaseResult,
   InterviewQuestionAnswer,
@@ -443,6 +444,10 @@ function AnswerCard({
               Code/image answer — OCR transcription pending or not available.
             </div>
           )}
+
+          {answer.answerType === "image" ? (
+            <CodingAnalysisPanel metadata={answer.scoringMetadata} />
+          ) : null}
 
           <div className="grid gap-4 md:grid-cols-2">
             {/* Left: score + criteria */}

@@ -53,14 +53,17 @@ export default function ScoreBreakdown({ overallScore, phaseResults }: ScoreBrea
         answer.voiceScoreStatus === "pending" ||
         answer.voiceScoreStatus === "processing" ||
         answer.codingScoreStatus === "pending" ||
-        answer.codingScoreStatus === "processing"
+        answer.codingScoreStatus === "processing" ||
+        answer.technicalScoreStatus === "pending" ||
+        answer.technicalScoreStatus === "processing"
     )
   );
   const hasFailedScoring = phaseResults.some((phaseResult) =>
     phaseResult.answers.some(
       (answer) =>
         answer.voiceScoreStatus === "failed" ||
-        answer.codingScoreStatus === "failed"
+        answer.codingScoreStatus === "failed" ||
+        answer.technicalScoreStatus === "failed"
     )
   );
   const message = overallMessage(overallScore);
@@ -91,7 +94,7 @@ export default function ScoreBreakdown({ overallScore, phaseResults }: ScoreBrea
               </Text>
             </View>
             <Text className="mt-3 text-center text-sm leading-6 text-text-secondary">
-              Voice and coding answers are still being processed or need review. Final scores will update after scoring completes.
+              Voice, technical, and coding answers are still being processed or need review. Final scores will update after scoring completes.
             </Text>
           </>
         ) : (
@@ -121,12 +124,15 @@ export default function ScoreBreakdown({ overallScore, phaseResults }: ScoreBrea
                 answer.voiceScoreStatus === "pending" ||
                 answer.voiceScoreStatus === "processing" ||
                 answer.codingScoreStatus === "pending" ||
-                answer.codingScoreStatus === "processing"
+                answer.codingScoreStatus === "processing" ||
+                answer.technicalScoreStatus === "pending" ||
+                answer.technicalScoreStatus === "processing"
             );
             const phaseFailed = phaseResult.answers.some(
               (answer) =>
                 answer.voiceScoreStatus === "failed" ||
-                answer.codingScoreStatus === "failed"
+                answer.codingScoreStatus === "failed" ||
+                answer.technicalScoreStatus === "failed"
             );
             const phaseUnscored = phasePending || phaseFailed;
             const width = `${phaseUnscored ? 6 : Math.max(4, Math.min(100, phaseResult.score))}%` as DimensionValue;

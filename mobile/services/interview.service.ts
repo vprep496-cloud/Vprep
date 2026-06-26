@@ -14,6 +14,8 @@ import type {
   QuestionDifficulty,
   SessionIntensity,
   SessionStartResult,
+  TechnicalScoreStatus,
+  TechnicalSubmitAck,
   TrackId,
   VoiceScoreStatus,
   VoiceSubmitAck,
@@ -59,6 +61,24 @@ interface BackendCodingStatusResponse {
     score: number | null;
     feedback: string | null;
     transcription: string | null;
+    criteriaScores: Record<string, number>;
+    estimatedSeconds: number;
+  }>;
+}
+
+interface BackendTechnicalSubmitAck {
+  questionIds: string[];
+  status: "pending";
+  message: string;
+  estimatedSeconds: number;
+}
+
+interface BackendTechnicalStatusResponse {
+  technicalAnswers: Array<{
+    questionId: string;
+    status: "pending" | "processing" | "complete" | "failed";
+    score: number | null;
+    feedback: string | null;
     criteriaScores: Record<string, number>;
     estimatedSeconds: number;
   }>;
@@ -134,6 +154,7 @@ interface BackendQuestionAnswer {
   codeAnalysis?: Record<string, unknown> | null;
   codingScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
   voiceScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
+  technicalScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
 }
 
 interface BackendPhaseResult {
@@ -282,6 +303,7 @@ function toQuestionAnswer(answer: BackendQuestionAnswer): InterviewQuestionAnswe
       : null,
     codingScoreStatus: answer.codingScoreStatus ?? null,
     voiceScoreStatus: answer.voiceScoreStatus ?? null,
+    technicalScoreStatus: answer.technicalScoreStatus ?? null,
   };
 }
 
@@ -397,6 +419,43 @@ export async function submitTextAnswerBatch(
     { timeout: ANSWER_SUBMISSION_TIMEOUT_MS }
   );
   return data.answers.map(toAnswerResult);
+}
+
+export async function submitTextAnswerBatchAsync(
+  params: SubmitTextAnswerBatchParams
+): Promise<TechnicalSubmitAck> {
+  const { data } = await api.post<BackendTechnicalSubmitAck>(
+    "/api/v1/interview/answer-batch-async",
+    {
+      session_id: params.sessionId,
+      phase: params.phase,
+      answers: params.answers.map((answer) => ({
+        question_id: answer.questionId,
+        text_answer: answer.textAnswer,
+      })),
+    },
+    { timeout: 30000 }
+  );
+  return {
+    questionIds: data.questionIds,
+    status: data.status,
+    message: data.message,
+    estimatedSeconds: data.estimatedSeconds,
+  };
+}
+
+export async function getTechnicalStatus(sessionId: string): Promise<TechnicalScoreStatus[]> {
+  const { data } = await api.get<BackendTechnicalStatusResponse>(
+    `/api/v1/interview/session/${sessionId}/technical-status`
+  );
+  return data.technicalAnswers.map((item) => ({
+    questionId: item.questionId,
+    status: item.status,
+    score: item.score,
+    feedback: item.feedback,
+    criteriaScores: item.criteriaScores ?? {},
+    estimatedSeconds: item.estimatedSeconds,
+  }));
 }
 
 // POST /api/v1/interview/complete — finalizes the session: computes weighted

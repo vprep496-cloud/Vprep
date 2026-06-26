@@ -161,8 +161,10 @@ export default function DashboardShell({
               {aiOk === null ? "Checking…" : aiOk ? "AI Active" : "AI Offline"}
             </span>
           </div>
-          {aiStatus?.models.scoring && (
-            <p className="mt-1 text-[10px] text-primary-300 truncate">{aiStatus.models.scoring}</p>
+          {aiStatus?.models.scoringCoding && (
+            <p className="mt-1 text-[10px] text-primary-300 truncate">
+              Code: {aiStatus.models.scoringCoding}
+            </p>
           )}
         </div>
 

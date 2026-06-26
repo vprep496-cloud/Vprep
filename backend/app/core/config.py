@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     # Firebase
     FIREBASE_SERVICE_ACCOUNT_PATH: str = "./firebase-service-account.json"
 
+    # Runtime mode. Development returns/logs safe auth diagnostics; production
+    # keeps auth failures generic.
+    ENVIRONMENT: str = "development"
+
     # Local AI provider. Mobile/admin clients call this FastAPI backend only;
     # the backend then talks to Ollama on the laptop through LangChain.
     AI_PROVIDER: str = "ollama"
@@ -69,6 +73,10 @@ class Settings(BaseSettings):
     @property
     def origins_list(self) -> list[str]:
         return [origin.strip() for origin in self.ALLOWED_ORIGINS.split(",") if origin.strip()]
+
+    @property
+    def is_development(self) -> bool:
+        return self.ENVIRONMENT.lower() in {"dev", "development", "local"}
 
     @property
     def ai_configured(self) -> bool:

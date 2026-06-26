@@ -16,7 +16,7 @@ from app.services.ai_provider import (
 
 logger = logging.getLogger("vprep.scoring_engine")
 
-RUBRIC_VERSION = "vprep-professional-scoring-v2"
+RUBRIC_VERSION = "vprep-professional-scoring-v3"
 ScoreMode = Literal[
     "hr_voice",
     "behavioral_voice",
@@ -77,6 +77,139 @@ _COMMON_SILENCE_HALLUCINATIONS = frozenset(
         "ok",
         "music",
     }
+)
+_TEXT_STOPWORDS = frozenset(
+    {
+        "a",
+        "about",
+        "above",
+        "after",
+        "again",
+        "against",
+        "all",
+        "am",
+        "an",
+        "and",
+        "any",
+        "are",
+        "as",
+        "at",
+        "be",
+        "because",
+        "been",
+        "before",
+        "being",
+        "between",
+        "both",
+        "but",
+        "by",
+        "can",
+        "could",
+        "did",
+        "do",
+        "does",
+        "doing",
+        "down",
+        "during",
+        "each",
+        "few",
+        "for",
+        "from",
+        "further",
+        "had",
+        "has",
+        "have",
+        "having",
+        "he",
+        "her",
+        "here",
+        "hers",
+        "herself",
+        "him",
+        "himself",
+        "his",
+        "how",
+        "i",
+        "if",
+        "in",
+        "into",
+        "is",
+        "it",
+        "its",
+        "itself",
+        "just",
+        "me",
+        "more",
+        "most",
+        "my",
+        "myself",
+        "no",
+        "nor",
+        "not",
+        "of",
+        "off",
+        "on",
+        "once",
+        "only",
+        "or",
+        "other",
+        "our",
+        "ours",
+        "ourselves",
+        "out",
+        "over",
+        "own",
+        "same",
+        "she",
+        "should",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "theirs",
+        "them",
+        "themselves",
+        "then",
+        "there",
+        "these",
+        "they",
+        "this",
+        "those",
+        "through",
+        "to",
+        "too",
+        "under",
+        "until",
+        "up",
+        "very",
+        "was",
+        "we",
+        "were",
+        "what",
+        "when",
+        "where",
+        "which",
+        "while",
+        "who",
+        "whom",
+        "why",
+        "will",
+        "with",
+        "would",
+        "you",
+        "your",
+        "yours",
+        "yourself",
+        "yourselves",
+    }
+)
+_GENERIC_NON_ANSWER_PATTERNS = (
+    re.compile(r"^\W*(i\s*(do\s*not|don't|dont)\s*know|idk|no\s+idea|not\s+sure)\W*$", re.I),
+    re.compile(r"^\W*(skip|pass|n/?a|none|nothing|blank|test|testing|asdf|qwerty)\W*$", re.I),
+    re.compile(r"^\W*(ok|okay|yes|no|hello|hi|thanks?|thank\s+you)\W*$", re.I),
 )
 
 
@@ -930,6 +1063,245 @@ def _contains_prompt_injection(text: str | None) -> bool:
     return any(marker in lowered for marker in markers)
 
 
+def _tokens_for_quality(text: str | None) -> list[str]:
+    return re.findall(r"[a-z0-9][a-z0-9'+-]*", (text or "").lower())
+
+
+def _content_tokens(text: str | None) -> list[str]:
+    tokens = _tokens_for_quality(text)
+    return [
+        token
+        for token in tokens
+        if len(token) > 2
+        and token not in _TEXT_STOPWORDS
+        and token not in _LOW_VALUE_VOICE_TOKENS
+    ]
+
+
+def _overlap_ratio(answer_terms: set[str], reference_terms: set[str]) -> float:
+    if not answer_terms or not reference_terms:
+        return 0.0
+    return len(answer_terms & reference_terms) / max(
+        1,
+        min(len(answer_terms), len(reference_terms)),
+    )
+
+
+def _is_generic_non_answer(text: str, content_word_count: int) -> bool:
+    compact = re.sub(r"\s+", " ", text.strip().lower())
+    if not compact:
+        return True
+    if any(pattern.match(compact) for pattern in _GENERIC_NON_ANSWER_PATTERNS):
+        return True
+    if content_word_count <= 3 and any(
+        phrase in compact
+        for phrase in (
+            "don't know",
+            "dont know",
+            "do not know",
+            "no idea",
+            "not sure",
+            "can't answer",
+            "cannot answer",
+        )
+    ):
+        return True
+    return False
+
+
+def _answer_quality_signals(
+    *,
+    answer_text: str | None,
+    question_text: str | None,
+    model_answer: str | None,
+    mode: ScoreMode,
+) -> dict[str, Any]:
+    text = str(answer_text or "").strip()
+    tokens = _tokens_for_quality(text)
+    content = _content_tokens(text)
+    answer_terms = set(content)
+    question_terms = set(_content_tokens(question_text))
+    model_terms = set(_content_tokens(model_answer))
+    reference_terms = question_terms | model_terms
+
+    unique_content_ratio = len(answer_terms) / max(1, len(content))
+    question_overlap = _overlap_ratio(answer_terms, question_terms)
+    model_overlap = _overlap_ratio(answer_terms, model_terms)
+    reference_overlap = _overlap_ratio(answer_terms, reference_terms)
+
+    min_content_words = {
+        "assessment_text": 3,
+        "technical_text": 4,
+        "coding_logic_image": 1,
+        "hr_voice": 6,
+        "behavioral_voice": 8,
+    }.get(mode, 4)
+    low_substance_words = {
+        "assessment_text": 5,
+        "technical_text": 6,
+        "coding_logic_image": 1,
+        "hr_voice": 12,
+        "behavioral_voice": 16,
+    }.get(mode, 6)
+
+    is_empty = not text
+    is_non_answer = _is_generic_non_answer(text, len(content))
+    min_chars = 4 if mode == "coding_logic_image" else 12
+    too_short = len(content) < min_content_words or len(text) < min_chars
+    low_substance = len(content) < low_substance_words
+    repeated_text = len(content) >= 8 and unique_content_ratio < 0.35
+    copied_question = (
+        bool(question_terms)
+        and len(content) >= 4
+        and question_overlap >= 0.78
+        and len(answer_terms - question_terms) <= 2
+    )
+    copied_model_answer = (
+        bool(model_terms)
+        and len(content) >= 18
+        and model_overlap >= 0.9
+    )
+    # Technical/assessment answers should share at least some domain signal
+    # with the question or rubric. Keep this as a cap, not a hard zero, because
+    # correct synonyms can evade lexical matching.
+    low_relevance_signal = (
+        mode in {"assessment_text", "technical_text"}
+        and len(content) >= low_substance_words
+        and bool(reference_terms)
+        and reference_overlap < 0.08
+    )
+
+    return {
+        "character_count": len(text),
+        "word_count": len(tokens),
+        "content_word_count": len(content),
+        "unique_content_word_count": len(answer_terms),
+        "unique_content_ratio": round(unique_content_ratio, 3),
+        "reference_overlap_ratio": round(reference_overlap, 3),
+        "question_overlap_ratio": round(question_overlap, 3),
+        "model_overlap_ratio": round(model_overlap, 3),
+        "is_empty": is_empty,
+        "is_non_answer": is_non_answer,
+        "too_short": too_short,
+        "low_substance": low_substance,
+        "repeated_text": repeated_text,
+        "copied_question": copied_question,
+        "copied_model_answer": copied_model_answer,
+        "low_relevance_signal": low_relevance_signal,
+        "prompt_injection": _contains_prompt_injection(text),
+    }
+
+
+def _quality_score_cap(signals: dict[str, Any], *, mode: ScoreMode) -> tuple[int, list[str], list[str]]:
+    cap = 100
+    reasons: list[str] = []
+    flags: list[str] = []
+
+    def apply(new_cap: int, reason: str, flag: str | None = None) -> None:
+        nonlocal cap
+        if new_cap < cap:
+            cap = new_cap
+        reasons.append(reason)
+        if flag:
+            flags.append(flag)
+
+    if signals["is_empty"]:
+        apply(0, "empty_answer", "empty_answer")
+        return cap, reasons, flags
+    if signals["is_non_answer"]:
+        apply(5, "generic_non_answer", "non_answer")
+    if signals["copied_question"]:
+        apply(20, "answer_mostly_copies_question", "copied_question")
+    if signals["prompt_injection"]:
+        apply(35, "possible_prompt_injection", "possible_prompt_injection")
+    if signals["too_short"]:
+        apply(
+            25 if mode in {"hr_voice", "behavioral_voice"} else 15,
+            "too_short_for_reliable_scoring",
+            "empty_or_too_short",
+        )
+    elif signals["low_substance"]:
+        apply(
+            50 if mode in {"hr_voice", "behavioral_voice"} else 45,
+            "low_substance_answer",
+            "low_substance",
+        )
+    if signals["repeated_text"]:
+        apply(30, "repetitive_low_diversity_answer", "repetitive_answer")
+    if signals["low_relevance_signal"]:
+        apply(45, "low_relevance_to_question_or_rubric", "low_relevance_signal")
+    if signals["copied_model_answer"]:
+        flags.append("near_reference_answer")
+
+    return cap, reasons, flags
+
+
+def _structured_evidence_score_cap(
+    *,
+    mode: ScoreMode,
+    star_analysis: dict[str, Any] | None,
+    code_analysis: dict[str, Any] | None,
+) -> tuple[int, list[str], list[str]]:
+    cap = 100
+    reasons: list[str] = []
+    flags: list[str] = []
+
+    def apply(new_cap: int, reason: str, flag: str | None = None) -> None:
+        nonlocal cap
+        if new_cap < cap:
+            cap = new_cap
+        reasons.append(reason)
+        if flag:
+            flags.append(flag)
+
+    if mode == "behavioral_voice" and star_analysis:
+        completeness = _coerce_int(star_analysis.get("completeness_score"), minimum=0, maximum=100)
+        if completeness <= 25:
+            apply(45, "behavioral_answer_missing_most_star_elements", "incomplete_star_answer")
+        if not star_analysis.get("action"):
+            apply(60, "behavioral_answer_missing_personal_action", "missing_personal_action")
+        if not star_analysis.get("result"):
+            apply(70, "behavioral_answer_missing_result_or_learning", "missing_result")
+    if mode == "coding_logic_image" and code_analysis:
+        reconstructed = str(code_analysis.get("reconstructed_code") or "").strip()
+        if not reconstructed:
+            apply(20, "coding_submission_has_no_readable_solution", "unreadable_image")
+        if code_analysis.get("main_case_correct") is False:
+            apply(55, "coding_solution_fails_primary_case", "main_case_incorrect")
+        if code_analysis.get("is_optimal") is False and code_analysis.get("main_case_correct") is True:
+            flags.append("non_optimal_solution")
+
+    return cap, reasons, flags
+
+
+def _cap_criteria_scores(criteria_scores: dict[str, int], score_cap: int) -> dict[str, int]:
+    criterion_cap = max(0, min(10, (score_cap + 9) // 10))
+    return {key: min(value, criterion_cap) for key, value in criteria_scores.items()}
+
+
+def _apply_structured_criterion_caps(
+    criteria_scores: dict[str, int],
+    *,
+    mode: ScoreMode,
+    star_analysis: dict[str, Any] | None,
+    code_analysis: dict[str, Any] | None,
+) -> dict[str, int]:
+    capped = dict(criteria_scores)
+    if mode == "behavioral_voice" and star_analysis:
+        if not star_analysis.get("action") and "action_ownership" in capped:
+            capped["action_ownership"] = min(capped["action_ownership"], 5)
+        if not star_analysis.get("result") and "result_impact" in capped:
+            capped["result_impact"] = min(capped["result_impact"], 4)
+    if mode == "coding_logic_image" and code_analysis:
+        if code_analysis.get("main_case_correct") is False:
+            for key in ("algorithm_correctness", "logic_correctness"):
+                if key in capped:
+                    capped[key] = min(capped[key], 4)
+        if not str(code_analysis.get("reconstructed_code") or "").strip():
+            capped = {key: min(value, 2) for key, value in capped.items()}
+    return capped
+
+
 def _lookup_score(raw_scores: dict[str, Any], criterion: Criterion) -> Any:
     if criterion.key in raw_scores:
         return raw_scores[criterion.key]
@@ -1014,6 +1386,7 @@ def _normalize_scored_answer(
     criteria: list[Criterion],
     mode: ScoreMode,
     model_answer: str,
+    question_text: str | None = None,
     include_transcription: bool = False,
     answer_text: str | None = None,
     media_duration_seconds: int | None = None,
@@ -1031,6 +1404,7 @@ def _normalize_scored_answer(
     )
     average = _weighted_average_score(criteria_scores, criteria)
     calibrated_overall = _coerce_int(average * 10, minimum=0, maximum=100)
+    pre_cap_overall = calibrated_overall
     raw_overall = _coerce_int(raw.get("overall_score", calibrated_overall), minimum=0, maximum=100)
     confidence = _coerce_float(raw.get("confidence"))
     transcription = _clean_text(raw.get("transcription")) if include_transcription else None
@@ -1102,11 +1476,59 @@ def _normalize_scored_answer(
                 "reconstructed_code": transcription,
             }
 
+    quality_text = answer_text
+    if quality_text is None and include_transcription:
+        quality_text = transcription
+    if not quality_text and mode == "coding_logic_image" and code_analysis is not None:
+        quality_text = code_analysis.get("reconstructed_code")
+    if mode == "coding_logic_image" and code_analysis and code_analysis.get("reconstructed_code"):
+        flags = [flag for flag in flags if flag != "missing_transcription"]
+    answer_quality = _answer_quality_signals(
+        answer_text=quality_text,
+        question_text=question_text,
+        model_answer=model_answer,
+        mode=mode,
+    )
+    quality_cap, quality_reasons, quality_flags = _quality_score_cap(answer_quality, mode=mode)
+    structure_cap, structure_reasons, structure_flags = _structured_evidence_score_cap(
+        mode=mode,
+        star_analysis=star_analysis,
+        code_analysis=code_analysis,
+    )
+    structured_criteria_scores = _apply_structured_criterion_caps(
+        criteria_scores,
+        mode=mode,
+        star_analysis=star_analysis,
+        code_analysis=code_analysis,
+    )
+    if structured_criteria_scores != criteria_scores:
+        criteria_scores = structured_criteria_scores
+        calibrated_overall = min(
+            calibrated_overall,
+            _coerce_int(_weighted_average_score(criteria_scores, criteria) * 10, minimum=0, maximum=100),
+        )
+    score_cap = min(quality_cap, structure_cap)
+    score_cap_reasons = quality_reasons + structure_reasons
+    if score_cap < calibrated_overall:
+        calibrated_overall = score_cap
+        criteria_scores = _cap_criteria_scores(criteria_scores, score_cap)
+        flags = sorted(set(flags + quality_flags + structure_flags + ["score_capped_by_evidence"]))
+    else:
+        flags = sorted(set(flags + quality_flags + structure_flags))
+    if abs(raw_overall - calibrated_overall) >= 15:
+        flags = sorted(set(flags + ["model_score_recalibrated", "manual_review_recommended"]))
+    if calibrated_overall <= 30:
+        flags = sorted(set(flags + ["very_low_score"]))
+
     metadata = {
         "rubric_version": RUBRIC_VERSION,
         "scoring_mode": mode,
         "raw_model_overall_score": raw_overall,
+        "pre_cap_overall_score": pre_cap_overall,
         "calibrated_overall_score": calibrated_overall,
+        "score_cap": score_cap if score_cap < 100 else None,
+        "score_cap_reasons": score_cap_reasons,
+        "answer_quality": answer_quality,
         "confidence": confidence,
         "criteria_weights": {criterion.key: criterion.weight for criterion in criteria},
         "review_flags": flags,
@@ -1160,6 +1582,7 @@ def _normalize_assessment_evaluation(
         criteria=criteria,
         mode="assessment_text",
         model_answer=item.get("model_answer", ""),
+        question_text=item.get("question", ""),
         answer_text=item.get("user_answer", ""),
     )
     score = _coerce_int(round(normalized["overall_score"] / 10), minimum=0, maximum=10)
@@ -1558,6 +1981,7 @@ async def score_interview_audio(
         criteria=criteria,
         mode=mode,
         model_answer=question.get("model_answer", ""),
+        question_text=question.get("question_text") or question.get("question") or "",
         include_transcription=True,
         answer_text=transcript,
         media_duration_seconds=duration_seconds,
@@ -1570,10 +1994,16 @@ async def score_interview_audio(
     llm_score      = result["overall_score"]      # 0–100 from LLM criteria
     delivery_score = features.delivery_score       # 0–100 from audio metrics
     composite      = max(0, min(100, round(llm_score * 0.85 + delivery_score * 0.15)))
+    meta = dict(result.get("scoring_metadata") or {})
+    score_cap = meta.get("score_cap")
+    if isinstance(score_cap, int) and composite > score_cap:
+        composite = score_cap
+        flags = sorted(set(result.get("review_flags", []) + ["score_capped_after_delivery_blend"]))
+        result["review_flags"] = flags
+        meta["review_flags"] = flags
     result["overall_score"] = composite
 
     # ── Step 6: Enrich metadata with full multi-dimensional analysis ──────────
-    meta = dict(result.get("scoring_metadata") or {})
     meta["scoring_breakdown"] = {
         "content_communication_score": llm_score,
         "delivery_score": delivery_score,
@@ -1604,6 +2034,7 @@ async def score_interview_text(question: dict, text_answer: str) -> dict[str, An
         criteria=criteria,
         mode=mode,
         model_answer=question.get("model_answer", ""),
+        question_text=question.get("question_text") or question.get("question") or "",
         answer_text=text_answer,
     )
 
@@ -1664,11 +2095,20 @@ async def score_interview_image(question: dict, image_bytes: bytes, mime_type: s
             criteria=criteria,
             mode=mode,
             model_answer=question.get("model_answer", ""),
+            question_text=question.get("question_text") or question.get("question") or "",
             include_transcription=True,
         )
         # Record which model was actually used for transparency in admin portal
         meta = dict(result.get("scoring_metadata") or {})
-        meta["provider"] = f"ollama/{model or default_model}"
+        actual_model = model or default_model
+        used_coding_model = bool(model and model == coding_model)
+        meta["provider"] = f"ollama/{actual_model}"
+        meta["model_name"] = actual_model
+        meta["model_role"] = "code_specialized" if used_coding_model else "general_fallback"
+        meta["coding_model_requested"] = coding_model
+        meta["coding_model_active"] = used_coding_model
+        meta["coding_num_ctx"] = num_ctx
+        meta["coding_timeout_seconds"] = timeout
         result["scoring_metadata"] = meta
         return result
 
@@ -1697,27 +2137,37 @@ async def score_interview_image(question: dict, image_bytes: bytes, mime_type: s
 
 def _heuristic_assessment_evaluation(item: dict, criteria: list[Criterion]) -> dict[str, Any]:
     """Keyword-overlap fallback used when the local model cannot score an
-    answer (whole-batch failure, or a single answer it silently dropped)."""
+    answer (whole-batch failure, or a single answer it silently dropped).
+
+    This is intentionally conservative: it can preserve obvious partial credit
+    but cannot award a high score without the model's criterion-level judgment.
+    """
     answer = str(item.get("user_answer", "")).strip()
-    model_terms = {
-        word.strip(".,:;()[]{}").lower()
-        for word in str(item.get("model_answer", "")).split()
-        if len(word.strip(".,:;()[]{}")) > 4
-    }
-    answer_terms = {
-        word.strip(".,:;()[]{}").lower()
-        for word in answer.split()
-        if len(word.strip(".,:;()[]{}")) > 4
-    }
+    signals = _answer_quality_signals(
+        answer_text=answer,
+        question_text=item.get("question", ""),
+        model_answer=item.get("model_answer", ""),
+        mode="assessment_text",
+    )
+    model_terms = set(_content_tokens(item.get("model_answer", "")))
+    answer_terms = set(_content_tokens(answer))
     overlap = len(model_terms & answer_terms)
-    if len(answer) < 20:
+    if signals["is_empty"]:
+        score = 0
+    elif signals["is_non_answer"]:
+        score = 1
+    elif signals["copied_question"] or signals["too_short"]:
         score = 2
-    elif overlap >= 6:
-        score = 7
-    elif overlap >= 3:
+    elif signals["low_relevance_signal"]:
+        score = 3
+    elif overlap >= 8 and signals["content_word_count"] >= 12:
+        score = 6
+    elif overlap >= 4:
         score = 5
-    else:
+    elif overlap >= 2:
         score = 4
+    else:
+        score = 3
     return _normalize_assessment_evaluation(
         {
             "question_id": item["id"],

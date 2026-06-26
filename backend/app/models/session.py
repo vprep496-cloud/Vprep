@@ -54,6 +54,8 @@ class QuestionAnswer(BaseModel):
     coding_score_status: Literal["pending", "processing", "complete", "failed"] | None = None
     # Async voice score lifecycle: "pending" → "processing" → "complete" | "failed"
     voice_score_status: Literal["pending", "processing", "complete", "failed"] | None = None
+    # Async technical text lifecycle: "pending" → "processing" → "complete" | "failed"
+    technical_score_status: Literal["pending", "processing", "complete", "failed"] | None = None
 
 
 class PhaseResult(BaseModel):
@@ -171,6 +173,24 @@ class BatchTextAnswerSubmission(BaseModel):
     session_id: str
     phase: str
     answers: list[BatchTextAnswer]
+
+
+class TechnicalBatchSubmitAck(BaseModel):
+    """Acknowledgement for async technical batch scoring."""
+    question_ids: list[str]
+    status: Literal["pending"] = "pending"
+    message: str
+    estimated_seconds: int = 90
+
+
+class TechnicalScoreStatusItem(BaseModel):
+    """Polling response for async technical text batch scoring."""
+    question_id: str
+    status: Literal["pending", "processing", "complete", "failed"]
+    score: int | None = None
+    feedback: str | None = None
+    criteria_scores: dict[str, int] = Field(default_factory=dict)
+    estimated_seconds: int = 90
 
 
 class AnswerResponse(BaseModel):

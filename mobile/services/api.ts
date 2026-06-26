@@ -40,8 +40,31 @@ const api = axios.create({
 api.interceptors.request.use(
   async (config) => {
     const token = await getItem(TOKEN_STORAGE_KEY);
-    if (token) {
+    const existingAuthorization =
+      config.headers.Authorization ?? config.headers.authorization;
+    if (token && !existingAuthorization) {
       config.headers.Authorization = `Bearer ${token}`;
+    }
+    if (__DEV__) {
+      const url = `${config.baseURL ?? ""}${config.url ?? ""}`;
+      const isAuthCheck =
+        url.includes("/api/v1/auth/sync") ||
+        url.includes("/api/v1/auth/me") ||
+        url.includes("/api/v1/tracks/enrolled");
+      if (isAuthCheck) {
+        console.log("[AxiosAuth] request auth header", {
+          url,
+          storageKey: TOKEN_STORAGE_KEY,
+          hasStoredToken: Boolean(token),
+          storedTokenLength: token?.length ?? 0,
+          storedTokenLooksLikeJwt: token ? token.split(".").length === 3 : false,
+          hadExplicitAuthorizationHeader: Boolean(existingAuthorization),
+          hasAuthorizationHeader: Boolean(config.headers.Authorization ?? config.headers.authorization),
+          authorizationHeaderStartsWithBearer: String(
+            config.headers.Authorization ?? config.headers.authorization ?? ""
+          ).startsWith("Bearer "),
+        });
+      }
     }
     return config;
   },
@@ -111,6 +134,7 @@ api.interceptors.response.use(
       );
     } else if (error?.response?.status === 401) {
       await deleteItem(TOKEN_STORAGE_KEY);
+      delete api.defaults.headers.common.Authorization;
     }
     return Promise.reject(error);
   }

@@ -26,6 +26,7 @@ import { adminApi } from "@/lib/api";
 import { TRACK_NAMES } from "@/lib/tracks";
 import RoleBadge from "@/components/ui/RoleBadge";
 import ScoreBadge from "@/components/ui/ScoreBadge";
+import CodingAnalysisPanel from "@/components/ui/CodingAnalysisPanel";
 import EnrollmentCard from "@/components/candidates/EnrollmentCard";
 import SessionHistoryTable from "@/components/candidates/SessionHistoryTable";
 import type { CandidateAssessment, InterviewQuestionAnswer, InterviewSessionResult } from "@/types";
@@ -259,6 +260,10 @@ function ReviewAnswerCard({
 
       {!isAsyncPending ? (
         <>
+          {answer.answerType === "image" ? (
+            <CodingAnalysisPanel metadata={answer.scoringMetadata} />
+          ) : null}
+
           {/* Feedback */}
           {answer.feedback ? (
             <>

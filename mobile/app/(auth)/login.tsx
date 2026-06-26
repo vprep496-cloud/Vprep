@@ -5,6 +5,7 @@ import AntDesign from "@expo/vector-icons/AntDesign";
 import Ionicons from "@expo/vector-icons/Ionicons";
 
 import { useAuth } from "../../hooks/useAuth";
+import { useAuthStore } from "../../stores/auth.store";
 import { colors, shadows } from "../../constants/theme";
 import { tapHaptic } from "../../lib/haptics";
 import VPrepLogo from "../../components/ui/VPrepLogo";
@@ -12,14 +13,13 @@ import VPrepLogo from "../../components/ui/VPrepLogo";
 const DEMO_ACCOUNTS = [
   { key: "candidate1", label: "Ahmad Raza", initials: "AR", tone: colors.primary[500], description: "ML/AI candidate" },
   { key: "candidate2", label: "Fatima Malik", initials: "FM", tone: colors.cranberry, description: "Web Dev candidate" },
-  { key: "admin", label: "Admin", initials: "AD", tone: colors.secondary, description: "Operations portal" },
-  { key: "superadmin", label: "Superadmin", initials: "SA", tone: colors.success, description: "Full system access" },
 ] as const;
 
 type DemoKey = (typeof DEMO_ACCOUNTS)[number]["key"];
 
 export default function LoginScreen() {
   const { signInWithGoogle, signInWithDemo, isGoogleSignInAvailable, isSigningIn, error } = useAuth();
+  const accessMessage = useAuthStore((s) => s.accessMessage);
   const [demoLoading, setDemoLoading] = useState<DemoKey | null>(null);
   const [demoError, setDemoError] = useState<string | null>(null);
 
@@ -42,7 +42,7 @@ export default function LoginScreen() {
   };
 
   const isBusy = isSigningIn || demoLoading !== null;
-  const displayError = demoError ?? error;
+  const displayError = demoError ?? error ?? accessMessage;
 
   return (
     <View className="flex-1 bg-background">

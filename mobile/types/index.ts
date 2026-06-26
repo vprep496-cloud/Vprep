@@ -258,6 +258,24 @@ export interface CodingSubmitAck {
   estimatedSeconds: number;
 }
 
+/** Async technical section polling response */
+export interface TechnicalScoreStatus {
+  questionId: string;
+  status: "pending" | "processing" | "complete" | "failed";
+  score: number | null;
+  feedback: string | null;
+  criteriaScores: Record<string, number>;
+  estimatedSeconds: number;
+}
+
+/** Async technical batch submission acknowledgement */
+export interface TechnicalSubmitAck {
+  questionIds: string[];
+  status: "pending";
+  message: string;
+  estimatedSeconds: number;
+}
+
 /** Async voice score polling response (one entry per voice answer in the session) */
 export interface VoiceScoreStatus {
   questionId: string;
@@ -384,6 +402,8 @@ export interface InterviewQuestionAnswer {
   codingScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
   /** Async voice score lifecycle — only present on async-scored voice answers */
   voiceScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
+  /** Async technical text lifecycle — only present on async-scored technical answers */
+  technicalScoreStatus?: "pending" | "processing" | "complete" | "failed" | null;
 }
 
 export interface InterviewPhaseResult {

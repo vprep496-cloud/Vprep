@@ -1,5 +1,9 @@
+import base64
+import json
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
 
 import firebase_admin
 from fastapi import HTTPException, status
@@ -63,27 +67,127 @@ def init_firebase() -> None:
         logger.info("Firebase Admin SDK initialized")
 
 
+def _safe_json_from_jwt_segment(segment: str) -> dict[str, Any] | None:
+    try:
+        padded = segment + ("=" * (-len(segment) % 4))
+        decoded = base64.urlsafe_b64decode(padded.encode("utf-8"))
+        data = json.loads(decoded.decode("utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _service_account_project_id() -> str | None:
+    settings = get_settings()
+    try:
+        path = Path(settings.FIREBASE_SERVICE_ACCOUNT_PATH)
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+        project_id = data.get("project_id")
+        return project_id if isinstance(project_id, str) else None
+    except Exception:
+        return None
+
+
+def _token_debug_metadata(token: str) -> dict[str, Any]:
+    parts = token.split(".")
+    metadata: dict[str, Any] = {
+        "authorization_token_length": len(token),
+        "token_looks_like_jwt": len(parts) == 3,
+        "backend_firebase_project_id": _service_account_project_id(),
+    }
+
+    if len(parts) != 3:
+        return metadata
+
+    header = _safe_json_from_jwt_segment(parts[0])
+    payload = _safe_json_from_jwt_segment(parts[1])
+
+    if header:
+        metadata["jwt_header_alg"] = header.get("alg")
+        metadata["jwt_header_kid"] = header.get("kid")
+
+    if payload:
+        aud = payload.get("aud")
+        iss = payload.get("iss")
+        metadata["jwt_payload_aud"] = aud
+        metadata["jwt_payload_iss"] = iss
+        backend_project_id = metadata.get("backend_firebase_project_id")
+        metadata["firebase_project_mismatch"] = bool(
+            isinstance(aud, str)
+            and isinstance(backend_project_id, str)
+            and aud != backend_project_id
+        )
+
+    return metadata
+
+
+def _auth_detail(reason: str) -> str:
+    settings = get_settings()
+    return reason if settings.is_development else "Invalid authentication token."
+
+
+def _log_firebase_verification_failure(reason: str, token: str, exc: Exception) -> None:
+    settings = get_settings()
+    if not settings.is_development:
+        return
+
+    logger.warning(
+        "[AuthDebug] Firebase token verification failed: %s",
+        {
+            "reason": reason,
+            "exception_class": exc.__class__.__name__,
+            "exception_message": str(exc),
+            **_token_debug_metadata(token),
+        },
+    )
+
+
 def verify_firebase_token(token: str) -> dict:
     """Verify a Firebase ID token and return its decoded claims.
 
     Raises HTTP 401 with a descriptive message for invalid/expired tokens or
     any other verification failure.
+    
+    Uses clock_skew_seconds=10 to tolerate up to 10 seconds of clock drift
+    between the mobile device, Firebase, and backend server.
     """
+    settings = get_settings()
+    if settings.is_development:
+        logger.info("[AuthDebug] Verifying Firebase token: %s", _token_debug_metadata(token))
+
     try:
-        return firebase_auth.verify_id_token(token)
-    except ExpiredIdTokenError:
+        # Allow up to 10 seconds clock skew (common on mobile devices with unsynced clocks)
+        decoded = firebase_auth.verify_id_token(token, clock_skew_seconds=10)
+        if settings.is_development:
+            logger.info(
+                "[AuthDebug] Firebase token verification succeeded (clock_skew_seconds=10): %s",
+                {
+                    "uid_present": bool(decoded.get("uid")),
+                    "aud": decoded.get("aud"),
+                    "iss": decoded.get("iss"),
+                    "backend_firebase_project_id": _service_account_project_id(),
+                },
+            )
+        return decoded
+    except ExpiredIdTokenError as exc:
+        _log_firebase_verification_failure("expired_firebase_token", token, exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Your session has expired. Please sign in again.",
+            detail=_auth_detail("expired_firebase_token"),
         )
-    except InvalidIdTokenError:
+    except InvalidIdTokenError as exc:
+        metadata = _token_debug_metadata(token)
+        reason = "firebase_project_mismatch" if metadata.get("firebase_project_mismatch") else "invalid_firebase_token"
+        _log_firebase_verification_failure(reason, token, exc)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token.",
+            detail=_auth_detail(reason),
         )
-    except Exception:
+    except Exception as exc:
+        _log_firebase_verification_failure("firebase_verification_error", token, exc)
         logger.exception("Unexpected error while verifying Firebase token")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Could not verify authentication token.",
+            detail=_auth_detail("firebase_verification_error"),
         )

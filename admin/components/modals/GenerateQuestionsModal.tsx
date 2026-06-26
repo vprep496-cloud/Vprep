@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import axios from "axios";
-import { Loader2, Sparkles, X } from "lucide-react";
+import { Code2, Loader2, Sparkles, X } from "lucide-react";
 
 import { adminApi } from "@/lib/api";
 import { DIFFICULTY_OPTIONS, PHASE_OPTIONS, type TrackOption } from "@/lib/tracks";
@@ -181,10 +181,23 @@ export default function GenerateQuestionsModal({
                 value={form.guidance}
                 onChange={(event) => update("guidance", event.target.value)}
                 rows={3}
-                placeholder="e.g. Focus on junior React Native candidates and practical debugging."
+                placeholder={
+                  form.phase === "coding_logic"
+                    ? "e.g. Generate professional handwritten coding tasks around offline sync, rate limits, retries, caching, routing, or data validation. Avoid toy/demo problems."
+                    : "e.g. Focus on junior React Native candidates and practical debugging."
+                }
                 className={`${FIELD_CLASS} resize-none`}
               />
             </label>
+
+            {form.phase === "coding_logic" ? (
+              <div className="mt-4 flex items-start gap-2.5 rounded-xl border border-sky-200 bg-sky-50 px-4 py-3">
+                <Code2 size={15} className="mt-0.5 shrink-0 text-sky-700" />
+                <p className="text-sm leading-5 text-sky-900">
+                  Coding generation is routed through the configured code-specialized model. Prompts are expected to be track-specific, hand-solvable, and scored on correctness, edge cases, complexity, and clarity.
+                </p>
+              </div>
+            ) : null}
 
             {/* Warning when about to run LLM */}
             {isSubmitting ? (

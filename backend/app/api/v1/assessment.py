@@ -95,9 +95,18 @@ async def submit_assessment(
         )
 
     if session.get("completed"):
+        result, plan = await assessment_service.get_existing_result(current_user["id"], payload.track_id)
+        if result is not None:
+            if plan is None:
+                plan = await assessment_service.generate_plan(
+                    current_user["id"],
+                    payload.track_id,
+                    result["skill_level"],
+                )
+            return {"result": result, "plan": plan}
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="This assessment has already been submitted.",
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This assessment was already submitted, but the saved result could not be found.",
         )
 
     question_ids = {question["id"] for question in session["questions"]}
@@ -134,7 +143,14 @@ async def submit_assessment(
 
     await db["assessment_sessions"].update_one(
         {"session_id": payload.session_id},
-        {"$set": {"completed": True}},
+        {
+            "$set": {
+                "completed": True,
+                "assessment_id": str(insert_result.inserted_id),
+                "plan_id": plan.get("id"),
+                "completed_at": now,
+            }
+        },
     )
 
     return {"result": result, "plan": plan}

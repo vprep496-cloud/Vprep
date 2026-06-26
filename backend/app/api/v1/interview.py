@@ -321,6 +321,49 @@ async def submit_text_answer_batch(
     return {"answers": responses}
 
 
+@router.post("/answer-batch-async", status_code=status.HTTP_202_ACCEPTED)
+async def submit_text_answer_batch_async(
+    payload: BatchTextAnswerSubmission,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Accept a technical text section immediately and score it in background.
+
+    This mirrors async voice/coding behavior: the answers are persisted first,
+    then local AI scoring runs after the response so the mobile app can move on.
+    """
+    session = await _get_owned_session(payload.session_id, current_user["id"], db)
+    _ = session
+
+    result = await interview_service.submit_text_answer_batch_async(
+        session_id=payload.session_id,
+        phase=payload.phase,
+        submitted_answers=payload.answers,
+        db=db,
+    )
+
+    background_tasks.add_task(
+        interview_service._score_text_answer_batch_background,
+        payload.session_id,
+        result["question_ids"],
+        db,
+    )
+
+    return result
+
+
+@router.get("/session/{session_id}/technical-status")
+async def get_technical_status(
+    session_id: str,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncIOMotorDatabase = Depends(get_db),
+):
+    """Poll async scoring status for technical text answers in a session."""
+    statuses = await interview_service.get_technical_score_status(session_id, current_user["id"], db)
+    return {"technical_answers": statuses}
+
+
 @router.post("/answer-coding", status_code=status.HTTP_202_ACCEPTED)
 async def submit_coding_answer(
     payload: CodingAnswerSubmission,
